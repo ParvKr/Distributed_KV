@@ -5,8 +5,8 @@ import java.util.Objects;
 
 public record LogEntry(long index, long term, Command command) {
     public LogEntry {
-        if (index < 1) throw new IllegalArgumentException("Index must start from 1");
-        if (term < 0) throw new IllegalArgumentException("Term must be positive");
+        if (index <= 0) throw new IllegalArgumentException("Index must start from 1");
+        if (term <= 0) throw new IllegalArgumentException("Term must start from 1");
         Objects.requireNonNull(command, "Command cannot be null");
     }
 
