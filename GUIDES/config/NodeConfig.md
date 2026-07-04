@@ -1,6 +1,8 @@
+Page - 001
+
 Responsible for the immutable, validated startup state of an individual node and calculating quorum requirements.
 
-[config/NodeConfig.java](https://github.com/ParvKr/Distributed_KV/blob/main/distributed-kv/src/main/java/io/github/parvgurung/config/NodeConfig.java)
+[CODE LINK - config/NodeConfig.java](https://github.com/ParvKr/Distributed_KV/blob/main/distributed-kv/src/main/java/io/github/parvgurung/config/NodeConfig.java)
 
 #### RESPONSIBILITY
 
@@ -46,3 +48,5 @@ Parses command-line arguments to establish the identity of the current node, set
 4. Why did we use a Java `record` for `PeerAddress`?
     - It is the idiomatic Java choice for plain, immutable data carriers.
     - It out-of-the-box handles constructor, getters, `equals()`, `hashCode()`, and  `toString()`, keeping the codebase free of boilerplate code while remaining inherently thread-safe.
+
+[NEXT - \[002\]util/Json.md](https://github.com/ParvKr/Distributed_KV/blob/main/GUIDES/util/Json.md)
