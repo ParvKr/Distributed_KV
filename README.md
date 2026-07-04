@@ -1,3 +1,5 @@
+Page - 000
+
 ### CONSENSUS
 
 In distributed systems, **consensus** simply means getting multiple independent computers to agree on a single data value or a specific state.
@@ -173,3 +175,5 @@ The cluster is perfectly unified again, and no committed data was lost!
     
     1. **Read Index (The Safe Standard)**: When a Leader receives a read request, it records its current commit index. Before replying, it must send a quick round of empty heartbeat RPCs to the cluster. If a majority responds, the Leader knows it is still the legitimate leader and can safely serve the data.
     2. **Leases (The High-Performance Standard)**: The cluster agrees that once a Leader is elected, it holds a time-bounded "lease" (e.g., 500ms) during which no other leader can possibly be elected. The Leader can answer reads instantly without network round-trips, provided its local clock says the lease is active.
+
+[START - \[001\]config/NodeConfig.md](https://github.com/ParvKr/Distributed_KV/blob/main/GUIDES/config/NodeConfig.md)
