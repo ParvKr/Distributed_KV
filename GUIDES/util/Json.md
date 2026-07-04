@@ -2,7 +2,7 @@ Page - 002
 
 A Zero-Dependency, Custom JSON Serializer and Recursive Descent Parser
 
-[LINK - util/Json.java](https://github.com/ParvKr/Distributed_KV/blob/main/distributed-kv/src/main/java/io/github/parvgurung/util/Json.java)
+[CODE LINK - util/Json.java](https://github.com/ParvKr/Distributed_KV/blob/main/distributed-kv/src/main/java/io/github/parvgurung/util/Json.java)
 
 #### RESPONSIBILITY
 
@@ -51,3 +51,5 @@ A Zero-Dependency, Custom JSON Serializer and Recursive Descent Parser
     - It performs strict character escaping.
     - If a string field inside the Key-Value store contains a literal double quote (`"`) or newline (`\n`), writing it unescaped would break the structure of the JSON text wire payload.
     - The method intercepts these and inserts backslashes (`\"`, `\n`) defensively.
+  
+[NEXT - \[003\]statemachine/commandTypes.md](https://github.com/ParvKr/Distributed_KV/blob/main/GUIDES/statemachine/commandType.md)
