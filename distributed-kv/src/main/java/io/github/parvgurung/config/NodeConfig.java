@@ -1,21 +1,8 @@
-/**
- * Immutable configuration for a Raft node.
- * Parses and validates startup arguments, exposing the node's identity,
- * networking information, storage location, and cluster peers.
- */
-
 package io.github.parvgurung.config;
 
 import java.nio.file.Path;
 import java.util.HashMap;
 import java.util.Map;
-
-/* Expected CLI args:
-* --id=1
-* --port=8001
-* --dataDir=./data (optional, defaults to ./data/node-<id>)
-* --peers=2:localhost:8002,3:localhost:8003
-*/
 
 public final class NodeConfig {
     public final int nodeId;
@@ -23,8 +10,7 @@ public final class NodeConfig {
     public final Path dataDir;
 
     public final Map<Integer, PeerAddress> peers;
-    
-    // Constructor for NodeConfig
+
     public NodeConfig(int nodeId, int port, Path dataDir, Map<Integer, PeerAddress> peers) {
         this.nodeId = nodeId;
         this.port = port;
@@ -32,12 +18,10 @@ public final class NodeConfig {
         this.peers = Map.copyOf(peers);
     }
 
-    // number of nodes in the cluster including this node.
     public int clusterSize() {
         return peers.size() + 1;
     }
 
-    // number of nodes(votes) required to form a majority in the cluster and elect a leader.
     public int majority() {
         return (clusterSize() / 2) + 1;
     }
