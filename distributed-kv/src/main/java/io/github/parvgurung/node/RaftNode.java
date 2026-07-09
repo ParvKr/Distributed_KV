@@ -31,12 +31,12 @@ public final class RaftNode implements RaftRpcHandler{
     private ScheduledFuture<?> heartbeatTask;
 
     private NodeRole role = NodeRole.FOLLOWER;
-    private Integer currentLeaderId = null;
+    private Long currentLeaderId = null;
     private long commitIndex = 0;
 
     public RaftNode(NodeConfig config) {
         this.config = config;
-        this.persistentState = new RaftPersistentState(config.dataDir);
+        this.persistentState = new RaftPersistentState(config.dataDir.toString());
         this.log = new PersistentLog(config.dataDir.toString());
         this.stateMachine = new KVStateMachine();
         this.rpcClient = new RpcClient();
@@ -147,7 +147,7 @@ public final class RaftNode implements RaftRpcHandler{
     // =================================================================
     private void becomeLeader() {
         role = NodeRole.LEADER;
-        currentLeaderId = config.nodeId;
+        currentLeaderId = (long) config.nodeId;
         electionTimer.cancel();
         heartbeatTask = heartbeatScheduler.scheduleAtFixedRate(this::sendHeartbeats, 0, HEARTBEAT_INTERVAL_MS, TimeUnit.MILLISECONDS);
     }
@@ -199,7 +199,99 @@ public final class RaftNode implements RaftRpcHandler{
         }
     }
 
+    // =================================================================
+    // RaftRpcHandler implementation -- called by RpcServer on incoming requests
+    // =================================================================
+
+    @Override
+    public synchronized RequestVoteResponse handleRequestVote(RequestVoteRequest request) {
+        long currentTerm = persistentState.getCurrentTerm();
+        if (request.term() < currentTerm) {
+            return new RequestVoteResponse(currentTerm, false);
+        }
+        if (request.term() > currentTerm) {
+            becomeFollower(request.term());
+            currentLeaderId = null;
+        }
+        currentTerm = persistentState.getCurrentTerm();
+        Integer votedFor = persistentState.votedFor();
+        int candidateId = Math.toIntExact(request.candidateId());
+        boolean logIsUpToDate = log.isCandidateLogUpToDate(request.lastLogIndex(), request.lastLogTerm());
+        boolean grant = (votedFor == null || votedFor.intValue() == candidateId) && logIsUpToDate;
+        if (grant) {
+            persistentState.setVotedFor(candidateId);
+            electionTimer.reset();
+        }
+        return new RequestVoteResponse(currentTerm, grant);
+    }
+
+    @Override
+    public synchronized AppendEntriesResponse handleAppendEntries(AppendEntriesRequest request) {
+        long currentTerm = persistentState.getCurrentTerm();
+        if (request.term() < currentTerm) {
+            return new AppendEntriesResponse(currentTerm, false, 0, 0);
+        }
+        if (request.term() > currentTerm || role != NodeRole.FOLLOWER) {
+            becomeFollower(request.term());
+        }
+        currentLeaderId = request.leaderId();
+        electionTimer.reset();
+        return new AppendEntriesResponse(persistentState.getCurrentTerm(), true, 0, 0);
+    }
+
+    @Override
+    public synchronized ClientResponse handleClientGet(String key) {
+        if (role != NodeRole.LEADER) {
+            return ClientResponse.notLeader(leaderHint());
+        }
+        return ClientResponse.OK(stateMachine.get(key).orElse(null));
+    }
+
+    @Override
+    public synchronized ClientResponse handleClientSet(String key, String value) {
+        if (role != NodeRole.LEADER) {
+            return ClientResponse.notLeader(leaderHint());
+        }
+        return ClientResponse.error("Write path requires log replication, implemented in Part 3.");
+    }
+
+    @Override
+    public synchronized ClientResponse handleClientDelete(String key) {
+        if (role != NodeRole.LEADER) {
+            return ClientResponse.notLeader(leaderHint());
+        }
+        return ClientResponse.error("Write path requires log replication, implemented in Part 3.");
+    }
+
+    private String leaderHint() {
+        if (currentLeaderId == null) return null;
+        Integer leaderInt = currentLeaderId == null ? null : currentLeaderId.intValue();
+        NodeConfig.PeerAddress peer = config.peers.get(leaderInt);
+        return peer == null ? null : peer.host() + ":" + peer.port();
+    }
+
+    @Override
+    public synchronized String statusSummary() {
+        return String.format("node=%d role=%s term=%d leader=%s logLastIndex=%d logLastTerm=%d commitIndex=%d %s", 
+        config.nodeId, role, persistentState.getCurrentTerm(),
+        currentLeaderId == null ? "unknown" : currentLeaderId.toString(),
+        log.lastIndex(), log.lastTerm(), commitIndex, stateMachine
+        );
+    }
+
+    public synchronized NodeRole role() {
+        return role;
+    }
+
     public synchronized long currentTerm() {
         return persistentState.getCurrentTerm();
+    }
+
+    public synchronized Long currentLeaderId() {
+        return currentLeaderId;
+    }
+
+    public int nodeId() {
+        return config.nodeId;
     }
 }
