@@ -27,9 +27,9 @@ public class RpcServer {
         server.setExecutor(Executors.newFixedThreadPool(200));
         server.createContext("/raft/requestVote", this::handleRequestVote);
         server.createContext("/raft/appendEntries", this::handleAppendEntries);
-        server.createContext("/client/Get", this::handleClientGet);
-        server.createContext("/client/Set", this::handleClientSet);
-        server.createContext("/client/Delete", this::handleClientDelete);
+        server.createContext("/client/get", this::handleClientGet);
+        server.createContext("/client/set", this::handleClientSet);
+        server.createContext("/client/delete", this::handleClientDelete);
         server.createContext("/status", this::handleStatus);
         server.start();
     }
