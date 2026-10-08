@@ -78,7 +78,7 @@ public class RpcServer {
             Map<String, Object> obj = Json.decode(body);
             String key = Json.getString(obj, "key");
             String value = Json.getString(obj, "value");
-            ClientResponse resp = handler.handleClientSet(key, value);
+            ClientResponse resp = handler.handleClientSet(key, value, Json.getString(obj, "clientId"), optionalSeq(obj));
             writeJson(exchange, 200, resp.toJson());
         });
     }
@@ -88,9 +88,13 @@ public class RpcServer {
             String body = readBody(exchange);
             Map<String, Object> obj = Json.decode(body);
             String key = Json.getString(obj, "key");
-            ClientResponse resp = handler.handleClientDelete(key);
+            ClientResponse resp = handler.handleClientDelete(key, Json.getString(obj, "clientId"), optionalSeq(obj));
             writeJson(exchange, 200, resp.toJson());
         });
+    }
+
+    private static long optionalSeq(Map<String, Object> obj) {
+        return obj.get("seq") == null ? 0 : Json.getLong(obj, "seq");
     }
 
     private void handleStatus(HttpExchange exchange) throws IOException {

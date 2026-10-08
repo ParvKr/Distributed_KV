@@ -32,6 +32,8 @@ public record AppendEntriesRequest(
             eoMap.put("commandType", e.command().type().name());
             eoMap.put("key", e.command().key());
             eoMap.put("value", e.command().value());
+            eoMap.put("clientId", e.command().clientId());
+            eoMap.put("seq", e.command().seq());
             entriesObjs.add(eoMap);
         }
         obj.put("entries", entriesObjs);
@@ -47,7 +49,9 @@ public record AppendEntriesRequest(
             Command command = new Command(
                 io.github.parvgurung.statemachine.CommandType.valueOf(Json.getString(eoMap, "commandType")),
                 Json.getString(eoMap, "key"),
-                Json.getString(eoMap, "value")
+                Json.getString(eoMap, "value"),
+                Json.getString(eoMap, "clientId"),
+                eoMap.get("seq") == null ? 0 : Json.getLong(eoMap, "seq")
             );
             entries.add(new LogEntry(index, term, command));
         }

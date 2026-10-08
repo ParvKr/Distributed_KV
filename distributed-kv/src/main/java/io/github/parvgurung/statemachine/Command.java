@@ -1,14 +1,28 @@
 package io.github.parvgurung.statemachine;
 
-public record Command(CommandType type, String key, String value) {
+/**
+ * A state machine command. Writes issued by a client carry that client's ID and a sequence number so
+ * that a retried request is applied at most once; commands without them (clientId == null, seq == 0)
+ * are always applied.
+ */
+public record Command(CommandType type, String key, String value, String clientId, long seq) {
+
+    public Command(CommandType type, String key, String value) {
+        this(type, key, value, null, 0);
+    }
 
     public Command {
         if (type == null) {
             throw new IllegalArgumentException("Command type cannot be null");
         }
+        if (clientId == null ? seq != 0 : (clientId.isEmpty() || seq < 1)) {
+            throw new IllegalArgumentException("A client ID needs a sequence number >= 1, and neither is allowed without the other");
+        }
         if (type == CommandType.NOOP) {
             key = "";
             value = null;
+            clientId = null;
+            seq = 0;
         } else {
             if (key == null || key.isEmpty()) {
                 throw new IllegalArgumentException("Key cannot be null or empty");
@@ -28,23 +42,35 @@ public record Command(CommandType type, String key, String value) {
         return new Command(CommandType.SET, key, value);
     }
 
+    public static Command set(String key, String value, String clientId, long seq) {
+        return new Command(CommandType.SET, key, value, clientId, seq);
+    }
+
     public static Command delete(String key) {
         return new Command(CommandType.DELETE, key, null);
     }
 
+    public static Command delete(String key, String clientId, long seq) {
+        return new Command(CommandType.DELETE, key, null, clientId, seq);
+    }
+
+    /** "TYPE|key|value", with "|clientId|seq" appended when the command belongs to a client session. */
     public String serialize() {
-        return String.join("|", type.name(), escape(key), escape(value));
+        String base = String.join("|", type.name(), escape(key), escape(value));
+        return clientId == null ? base : base + "|" + escape(clientId) + "|" + seq;
     }
 
     public static Command deserialize(String line) {
         var parts = line.split("\\|", -1);
-        if (parts.length != 3) {
+        if (parts.length != 3 && parts.length != 5) {
             throw new IllegalArgumentException("Malformed command line: " + line);
         }
         CommandType type = CommandType.valueOf(parts[0]);
         String key = unescape(parts[1]);
         String value = unescape(parts[2]);
-        return new Command(type, key, type == CommandType.SET ? value : null);
+        String clientId = parts.length == 5 ? unescape(parts[3]) : null;
+        long seq = parts.length == 5 ? Long.parseLong(parts[4]) : 0;
+        return new Command(type, key, type == CommandType.SET ? value : null, clientId, seq);
     }
 
     private static String escape(String str) {

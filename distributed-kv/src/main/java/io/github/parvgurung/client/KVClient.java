@@ -24,6 +24,10 @@ public final class KVClient {
         .connectTimeout(Duration.ofMillis(500))
         .build();
     private volatile String cachedLeader;
+    // Identifies this client's session. Retries of one write reuse its sequence number, so the cluster
+    // applies it at most once even if an earlier attempt committed after we gave up on it.
+    private final String clientId = UUID.randomUUID().toString();
+    private long nextSeq = 1;
     public KVClient(List<String> knownNodes) {
         if (knownNodes.isEmpty()) {
             throw new IllegalArgumentException("Need at least one node address");
@@ -37,20 +41,29 @@ public final class KVClient {
         return response.value();
     }
 
-    public void set(String key, String value) throws IOException {
+    // set/delete are synchronized because the cluster dedups by "highest sequence seen per client", which
+    // only works with one write in flight at a time.
+    public synchronized void set(String key, String value) throws IOException {
         requireKey(key);
         if (value == null) throw new IllegalArgumentException("Value cannot be null");
         Map<String, Object> body = new LinkedHashMap<>();
         body.put("key", key);
         body.put("value", value);
+        addSession(body);
         executeWithRedirect(nodeUrl -> doPost(nodeUrl, "/client/set", body));
     }
 
-    public void delete(String key) throws IOException {
+    public synchronized void delete(String key) throws IOException {
         requireKey(key);
         Map<String, Object> body = new LinkedHashMap<>();
         body.put("key", key);
+        addSession(body);
         executeWithRedirect(nodeUrl -> doPost(nodeUrl, "/client/delete", body));
+    }
+
+    private void addSession(Map<String, Object> body) {
+        body.put("clientId", clientId);
+        body.put("seq", nextSeq++);
     }
 
     private static void requireKey(String key) {

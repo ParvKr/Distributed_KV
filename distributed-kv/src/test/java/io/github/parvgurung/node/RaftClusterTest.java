@@ -223,6 +223,47 @@ class RaftClusterTest {
     }
 
     @Test
+    void retriedWriteDoesNotOverwriteALaterWriteFromAnotherClient() throws Exception {
+        startCluster(3);
+        RaftNode leader = awaitLeader();
+
+        assertTrue(post(leader, "/client/set", "key", "k", "value", "from-A", "clientId", "A", "seq", 1).success());
+        assertTrue(post(leader, "/client/set", "key", "k", "value", "from-B", "clientId", "B", "seq", 1).success());
+        // A never saw the first reply and retries the very same request.
+        ClientResponse retry = post(leader, "/client/set", "key", "k", "value", "from-A", "clientId", "A", "seq", 1);
+
+        assertTrue(retry.success(), "a retry of an applied write should be acknowledged: " + retry.error());
+        assertEquals("from-B", awaitGet(leader, "k"));
+    }
+
+    @Test
+    void requestDedupSurvivesFullClusterRestart() throws Exception {
+        startCluster(3);
+        RaftNode leader = awaitLeader();
+        assertTrue(post(leader, "/client/set", "key", "k", "value", "from-A", "clientId", "A", "seq", 1).success());
+        assertTrue(post(leader, "/client/set", "key", "k", "value", "from-B", "clientId", "B", "seq", 1).success());
+        awaitAllNodesCommitted(3);
+
+        for (RaftNode n : nodes) n.shutdown();
+        nodes.clear();
+        startCluster(3);
+
+        RaftNode newLeader = awaitLeader();
+        assertEquals("from-B", awaitGet(newLeader, "k")); // log replayed; sessions rebuilt with it
+        ClientResponse retry = post(newLeader, "/client/set", "key", "k", "value", "from-A", "clientId", "A", "seq", 1);
+        assertTrue(retry.success(), retry.error());
+        assertEquals("from-B", awaitGet(newLeader, "k"));
+    }
+
+    @Test
+    void sessionWithoutSequenceIsABadRequest() throws Exception {
+        startCluster(1);
+        RaftNode leader = awaitLeader();
+        ClientResponse r = post(leader, "/client/set", "key", "k", "value", "v", "clientId", "A");
+        assertFalse(r.success());
+    }
+
+    @Test
     void getWithoutKeyIsABadRequest() throws Exception {
         startCluster(3);
         RaftNode leader = awaitLeader();
@@ -324,9 +365,9 @@ class RaftClusterTest {
         return fail("read never succeeded: " + last);
     }
 
-    private ClientResponse post(RaftNode node, String path, String... kv) throws Exception {
+    private ClientResponse post(RaftNode node, String path, Object... kv) throws Exception {
         Map<String, Object> body = new LinkedHashMap<>();
-        for (int i = 0; i < kv.length; i += 2) body.put(kv[i], kv[i + 1]);
+        for (int i = 0; i < kv.length; i += 2) body.put((String) kv[i], kv[i + 1]);
         HttpRequest req = HttpRequest.newBuilder(uri(node, path))
             .timeout(Duration.ofSeconds(5))
             .header("Content-Type", "application/json")

@@ -470,13 +470,13 @@ public final class RaftNode implements RaftRpcHandler{
     }
 
     @Override
-    public ClientResponse handleClientSet(String key, String value) {
-        return handleClientWrite(Command.set(key, value), value);
+    public ClientResponse handleClientSet(String key, String value, String clientId, long seq) {
+        return handleClientWrite(Command.set(key, value, clientId, seq), value);
     }
 
     @Override
-    public ClientResponse handleClientDelete(String key) {
-        return handleClientWrite(Command.delete(key), null);
+    public ClientResponse handleClientDelete(String key, String clientId, long seq) {
+        return handleClientWrite(Command.delete(key, clientId, seq), null);
     }
 
     private ClientResponse handleClientWrite(Command command, String responseValueOnSuccess) {
@@ -485,6 +485,9 @@ public final class RaftNode implements RaftRpcHandler{
         synchronized (this) {
             if (role != NodeRole.LEADER) {
                 return ClientResponse.notLeader(leaderHint());
+            }
+            if (stateMachine.isDuplicate(command.clientId(), command.seq())) {
+                return ClientResponse.OK(responseValueOnSuccess); // a retry of a write that already committed
             }
             try {
                 index = log.lastIndex() + 1;
