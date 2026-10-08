@@ -21,6 +21,7 @@ public class KVStateMachine {
         switch (command.type()) {
             case SET -> data.put(command.key(), command.value());
             case DELETE -> data.remove(command.key());
+            case NOOP -> { }
             default -> throw new IllegalArgumentException("Unknown command type: " + command.type());
         }
 

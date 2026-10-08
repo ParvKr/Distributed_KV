@@ -1,7 +1,7 @@
 package io.github.parvgurung;
 
 import io.github.parvgurung.config.NodeConfig;
-import io.github.parvgurung.node.RaftNode;;
+import io.github.parvgurung.node.RaftNode;
 
 public final class Main {
     public static void main(String[] args) {

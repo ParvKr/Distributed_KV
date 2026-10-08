@@ -133,7 +133,10 @@ public final class Json {
         p.skipWhitespace();
         Object result = p.parseValue();
         if(!(result instanceof Map))
-            throw new IllegalArgumentException("Expected JSON object at the root, but got: " +result.getClass());
+            throw new IllegalArgumentException("Expected JSON object at the root, but got: " + (result == null ? "null" : result.getClass()));
+        p.skipWhitespace();
+        if(!p.atEnd())
+            throw new IllegalArgumentException("Unexpected trailing content at position " + p.pos + " in: " + json);
         @SuppressWarnings("unchecked")
         Map<String, Object> map = (Map<String, Object>) result;
         return map;
@@ -145,6 +148,10 @@ public final class Json {
 
         Parser(String s) {
             this.s = s;
+        }
+
+        boolean atEnd() {
+            return pos >= s.length();
         }
 
         void skipWhitespace() {

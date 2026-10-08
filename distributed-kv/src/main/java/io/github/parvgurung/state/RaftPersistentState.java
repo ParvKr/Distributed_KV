@@ -1,10 +1,11 @@
 package io.github.parvgurung.state;
 
+import io.github.parvgurung.util.FileUtil;
+
 import java.io.IOException;
 import java.nio.charset.StandardCharsets;
 import java.nio.file.Files;
 import java.nio.file.Path;
-import java.nio.file.StandardOpenOption;
 
 public final class RaftPersistentState {
     private final Path filePath;
@@ -56,10 +57,19 @@ public final class RaftPersistentState {
         persist();
     }
 
+    /** Moves to {@code term} and records the vote in a single durable write. */
+    public synchronized void setTermAndVote(long term, Integer candidateId) {
+        if (term < currentTerm)
+            throw new IllegalArgumentException("Cannot move term backward: " + currentTerm + " -> " + term);
+        currentTerm = term;
+        votedFor = candidateId;
+        persist();
+    }
+
     private void persist() {
         try {
             String content = "term=" + currentTerm + "\nvotedFor=" + (votedFor == null ? "" : votedFor) + "\n";
-            Files.writeString(filePath, content, StandardCharsets.UTF_8, StandardOpenOption.CREATE, StandardOpenOption.TRUNCATE_EXISTING, StandardOpenOption.WRITE);
+            FileUtil.writeAtomically(filePath, content.getBytes(StandardCharsets.UTF_8));
         } catch (IOException e) {
             throw new RuntimeException("Failed to persist Raft state -- cannot safely continue", e);
         }

@@ -12,12 +12,15 @@ import java.net.http.HttpResponse;
 import java.nio.charset.StandardCharsets;
 import java.time.Duration;
 import java.util.*;
+import java.util.concurrent.TimeUnit;
 
 public final class KVClient {
-    private static final int MAX_ATTEMPTS = 10;
+    // Long enough to ride out an election (election timeouts are 0.8-1.5s).
+    private static final long RETRY_WINDOW_MS = 10_000;
     private static final long RETRY_BACKOFF_MS = 200;
     private final List<String> knownNodes;
     private final HttpClient http = HttpClient.newBuilder()
+        .version(HttpClient.Version.HTTP_1_1)
         .connectTimeout(Duration.ofMillis(500))
         .build();
     private volatile String cachedLeader;
@@ -29,11 +32,14 @@ public final class KVClient {
     }
 
     public String get(String key) throws IOException {
+        requireKey(key);
         ClientResponse response = executeWithRedirect(nodeUrl -> doGet(nodeUrl, key));
         return response.value();
     }
 
     public void set(String key, String value) throws IOException {
+        requireKey(key);
+        if (value == null) throw new IllegalArgumentException("Value cannot be null");
         Map<String, Object> body = new LinkedHashMap<>();
         body.put("key", key);
         body.put("value", value);
@@ -41,9 +47,14 @@ public final class KVClient {
     }
 
     public void delete(String key) throws IOException {
+        requireKey(key);
         Map<String, Object> body = new LinkedHashMap<>();
         body.put("key", key);
         executeWithRedirect(nodeUrl -> doPost(nodeUrl, "/client/delete", body));
+    }
+
+    private static void requireKey(String key) {
+        if (key == null || key.isEmpty()) throw new IllegalArgumentException("Key cannot be null or empty");
     }
 
     private interface Request {
@@ -57,7 +68,9 @@ public final class KVClient {
             if (!toTry.contains(node)) toTry.add(node);
         }
         IOException lastError = null;
-        for (int attempt = 0; attempt < MAX_ATTEMPTS; attempt++) {
+        String lastServerError = null;
+        long deadline = System.nanoTime() + TimeUnit.MILLISECONDS.toNanos(RETRY_WINDOW_MS);
+        while (System.nanoTime() < deadline) {
             if (toTry.isEmpty()) {
                 sleep(RETRY_BACKOFF_MS);
                 for (String node : knownNodes) toTry.add(node);
@@ -74,12 +87,15 @@ public final class KVClient {
                     toTry.addFirst(cachedLeader);
                     continue;
                 }
+                if (!response.isNotLeader() && response.error() != null)
+                    lastServerError = response.error();
             } catch (IOException e) {
                 lastError = e; // node unreachable -- move on to the next candidate
             }
         }
-        throw new IOException("Could not reach the cluster leader after " + MAX_ATTEMPTS + " attempts"
-            + (lastError != null ? " (last error: " + lastError.getMessage() + ")" : ""));
+        throw new IOException("Could not complete the request within " + RETRY_WINDOW_MS + "ms"
+            + (lastServerError != null ? " (last server error: " + lastServerError + ")" : "")
+            + (lastError != null ? " (last connection error: " + lastError.getMessage() + ")" : ""));
     }  
     
     private static void sleep(long ms) {
@@ -111,7 +127,10 @@ public final class KVClient {
     private ClientResponse send(HttpRequest request) throws IOException {
         try {
             HttpResponse<String> response = http.send(request, HttpResponse.BodyHandlers.ofString());
-            return ClientResponse.fromJson(response.body());
+            ClientResponse parsed = ClientResponse.fromJson(response.body());
+            if (response.statusCode() == 400)
+                throw new IllegalArgumentException(parsed.error()); // our request is bad; retrying can't help
+            return parsed;
         } catch (InterruptedException e) {
             Thread.currentThread().interrupt();
             throw new IOException("Interrupted while waiting for response", e);
@@ -158,7 +177,7 @@ public final class KVClient {
                     System.exit(1);
                 }
             }
-        } catch (IOException e) {
+        } catch (IOException | IllegalArgumentException e) {
             System.err.println("Error: " + e.getMessage());
             System.exit(1);
         }
@@ -178,7 +197,7 @@ public final class KVClient {
             --nodes=host:port,host:port,... set <key> <value>
             --nodes=host:port,host:port,... delete <key>
             Example:
-            java -cp target/classes com.parv.raftkv.client.KVClient \\
+            java -cp target/classes io.github.parvgurung.client.KVClient \\
             --nodes=localhost:8001,localhost:8002,localhost:8003 set foo bar
             """
         );

@@ -23,6 +23,10 @@ public record ClientResponse(
         return new ClientResponse(false, null, message, null);
     }
     
+    public boolean isNotLeader() {
+        return !success && "not leader".equals(error);
+    }
+
     public String toJson() {
         Map<String, Object> obj = new LinkedHashMap<>();
         obj.put("success", success);

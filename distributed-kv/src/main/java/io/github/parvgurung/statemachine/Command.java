@@ -6,9 +6,22 @@ public record Command(CommandType type, String key, String value) {
         if (type == null) {
             throw new IllegalArgumentException("Command type cannot be null");
         }
-        if (key == null || key.isEmpty()) {
-            throw new IllegalArgumentException("Key cannot be null or empty");
+        if (type == CommandType.NOOP) {
+            key = "";
+            value = null;
+        } else {
+            if (key == null || key.isEmpty()) {
+                throw new IllegalArgumentException("Key cannot be null or empty");
+            }
+            if (type == CommandType.SET && value == null) {
+                throw new IllegalArgumentException("Value cannot be null for SET");
+            }
         }
+    }
+
+    /** Placeholder a new leader appends so entries from earlier terms can be committed. */
+    public static Command noop() {
+        return new Command(CommandType.NOOP, "", null);
     }
 
     public static Command set(String key, String value) {

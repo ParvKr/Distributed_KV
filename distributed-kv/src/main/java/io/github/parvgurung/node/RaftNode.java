@@ -21,6 +21,7 @@ public final class RaftNode implements RaftRpcHandler{
     private static final int ELECTION_TIMEOUT_MAX_MS = 1500;
     private static final int HEARTBEAT_INTERVAL_MS = 100;
     private static final long CLIENT_WRITE_TIMEOUT_MS = 2000;
+    private static final long LEADERSHIP_CONFIRM_TIMEOUT_MS = 1000;
 
     private final NodeConfig config;
     private final RaftPersistentState persistentState;
@@ -38,6 +39,7 @@ public final class RaftNode implements RaftRpcHandler{
     private NodeRole role = NodeRole.FOLLOWER;
     private Long currentLeaderId = null;
     private long commitIndex = 0;
+    private long leaderNoopIndex = 0;
 
     private final Map<Integer, Long> nextIndex = new ConcurrentHashMap<>();
     private final Map<Integer, Long> matchIndex = new ConcurrentHashMap<>();
@@ -82,7 +84,7 @@ public final class RaftNode implements RaftRpcHandler{
         rpcExecutor.shutdownNow();
         heartbeatScheduler.shutdownNow();
         if (rpcServer != null) rpcServer.stop();
-            log.close();
+        log.close();
     }
 
     // =================================================================
@@ -91,7 +93,7 @@ public final class RaftNode implements RaftRpcHandler{
     private void onElectionTimeout() {
         synchronized (this) {
             if (role == NodeRole.LEADER) {
-            return;
+                return;
             }
         }
         startElection();
@@ -104,9 +106,11 @@ public final class RaftNode implements RaftRpcHandler{
         final int myId = config.nodeId;
         synchronized (this) {
             if (role == NodeRole.LEADER) return;
+            // The timeout may be stale: a vote or heartbeat can have reset the timer while this task
+            // waited for the lock. Starting an election then would needlessly depose a healthy leader.
+            if (!electionTimer.hasElapsed()) return;
             role = NodeRole.CANDIDATE;
-            persistentState.setCurrentTerm(persistentState.getCurrentTerm() + 1);
-            persistentState.setVotedFor(myId);
+            persistentState.setTermAndVote(persistentState.getCurrentTerm() + 1, myId);
             currentLeaderId = null;
 
             electionTerm = persistentState.getCurrentTerm();
@@ -156,17 +160,29 @@ public final class RaftNode implements RaftRpcHandler{
     // Role transitions -- callers must hold the lock (synchronized(this))
     // =================================================================
     private void becomeLeader() {
+        final long term = persistentState.getCurrentTerm();
+        final long noopIndex = log.lastIndex() + 1;
+        try {
+            // A leader can only commit entries from its own term (Raft section 5.4.2). Appending a no-op
+            // gets earlier-term entries committed, and tells us when our state machine is current for reads.
+            log.append(new LogEntry(noopIndex, term, Command.noop()));
+        } catch (IOException e) {
+            System.err.println("Node " + config.nodeId + " could not append leader no-op, staying follower: " + e.getMessage());
+            becomeFollower(term);
+            return;
+        }
         role = NodeRole.LEADER;
         currentLeaderId = (long) config.nodeId;
+        leaderNoopIndex = noopIndex;
         electionTimer.cancel();
 
-        long next = log.lastIndex() + 1;
         nextIndex.clear();
         matchIndex.clear();
         for (Integer peerId : config.peers.keySet()) {
-            nextIndex.put(peerId, next);
+            nextIndex.put(peerId, noopIndex);
             matchIndex.put(peerId, 0L);
         }
+        tryAdvanceCommitIndex(); // a single-node cluster commits on its own
         cancelHeartbeat();
         heartbeatTask = heartbeatScheduler.scheduleAtFixedRate(this::replicateToAllPeers, 0, HEARTBEAT_INTERVAL_MS, TimeUnit.MILLISECONDS);
     }
@@ -245,15 +261,19 @@ public final class RaftNode implements RaftRpcHandler{
                 return;
             }
             if (response.success()) {
-                long newMatch = prevLogIndex + entries.size();
+                // Replies can arrive out of order; never let a stale one move matchIndex backwards.
+                long newMatch = Math.max(matchIndex.getOrDefault(peerId, 0L), prevLogIndex + entries.size());
                 matchIndex.put(peerId, newMatch);
                 nextIndex.put(peerId, newMatch + 1);
                 tryAdvanceCommitIndex();
-            } else {
-                long newNext = resolveConflict(response, myLastIndexAtSend);
+            } else if (response.conflictIndex() > 0) {
+                // A real log mismatch. Always step back at least one entry so the retry makes progress.
+                long newNext = Math.max(1, Math.min(resolveConflict(response, myLastIndexAtSend), prevLogIndex));
                 nextIndex.put(peerId, newNext);
                 rpcExecutor.submit(() -> replicateToPeer(peerId, peerAddress));
             }
+            // else: the follower failed for a reason unrelated to the log (e.g. disk error). Retry on the
+            // next heartbeat rather than hammering it.
         }
     }
 
@@ -367,8 +387,12 @@ public final class RaftNode implements RaftRpcHandler{
             return new AppendEntriesResponse(persistentState.getCurrentTerm(), false, 0, 0);
         }
 
-        if (request.leaderCommit() > commitIndex) {
-            commitIndex = Math.min(request.leaderCommit(), log.lastIndex());
+        // Only entries this request verified match the leader's log may be committed; anything beyond
+        // them could be a stale suffix from an older leader.
+        long lastNewIndex = prevLogIndex + request.entries().size();
+        long newCommit = Math.min(request.leaderCommit(), lastNewIndex);
+        if (newCommit > commitIndex) {
+            commitIndex = newCommit;
             applyCommitted();
         }
         return new AppendEntriesResponse(persistentState.getCurrentTerm(), true, 0, 0);
@@ -384,20 +408,74 @@ public final class RaftNode implements RaftRpcHandler{
     }
 
     @Override
-    public synchronized ClientResponse handleClientGet(String key) {
-        if (role != NodeRole.LEADER) {
-            return ClientResponse.notLeader(leaderHint());
+    public ClientResponse handleClientGet(String key) {
+        final long term;
+        synchronized (this) {
+            if (role != NodeRole.LEADER) {
+                return ClientResponse.notLeader(leaderHint());
+            }
+            if (commitIndex < leaderNoopIndex) {
+                return ClientResponse.error("Leader has not committed an entry in its term yet; retry");
+            }
+            term = persistentState.getCurrentTerm();
         }
-        return ClientResponse.OK(stateMachine.get(key).orElse(null));
+        // A deposed leader can still believe it leads. Only answer once a majority has confirmed our term.
+        if (!confirmLeadership(term)) {
+            return ClientResponse.error("Could not confirm leadership with a majority");
+        }
+        synchronized (this) {
+            if (role != NodeRole.LEADER || persistentState.getCurrentTerm() != term) {
+                return ClientResponse.notLeader(leaderHint());
+            }
+            return ClientResponse.OK(stateMachine.get(key).orElse(null));
+        }
+    }
+
+    private boolean confirmLeadership(long term) {
+        if (config.peers.isEmpty()) return true;
+        AtomicInteger acks = new AtomicInteger(1);
+        CompletableFuture<Boolean> confirmed = new CompletableFuture<>();
+        // Empty heartbeat that always passes the consistency check, so any same-term reply is an ack.
+        AppendEntriesRequest heartbeat = new AppendEntriesRequest(term, config.nodeId, 0, 0, List.of(), 0);
+        for (NodeConfig.PeerAddress peer : config.peers.values()) {
+            try {
+                rpcExecutor.submit(() -> {
+                    Optional<AppendEntriesResponse> responseOpt = rpcClient.sendAppendEntries(peer.baseUrl(), heartbeat);
+                    if (responseOpt.isEmpty()) return;
+                    AppendEntriesResponse response = responseOpt.get();
+                    synchronized (this) {
+                        if (response.term() > persistentState.getCurrentTerm()) {
+                            becomeFollower(response.term());
+                            currentLeaderId = null;
+                        }
+                    }
+                    if (response.term() > term) {
+                        confirmed.complete(false);
+                    } else if (response.term() == term && acks.incrementAndGet() >= config.majority()) {
+                        confirmed.complete(true);
+                    }
+                });
+            } catch (RejectedExecutionException e) {
+                return false; // shutting down
+            }
+        }
+        try {
+            return confirmed.get(LEADERSHIP_CONFIRM_TIMEOUT_MS, TimeUnit.MILLISECONDS);
+        } catch (InterruptedException e) {
+            Thread.currentThread().interrupt();
+            return false;
+        } catch (ExecutionException | TimeoutException e) {
+            return false;
+        }
     }
 
     @Override
-    public synchronized ClientResponse handleClientSet(String key, String value) {
+    public ClientResponse handleClientSet(String key, String value) {
         return handleClientWrite(Command.set(key, value), value);
     }
 
     @Override
-    public synchronized ClientResponse handleClientDelete(String key) {
+    public ClientResponse handleClientDelete(String key) {
         return handleClientWrite(Command.delete(key), null);
     }
 
@@ -416,6 +494,7 @@ public final class RaftNode implements RaftRpcHandler{
             }
             future = new CompletableFuture<>();
             pendingClientWrites.put(index, future);
+            tryAdvanceCommitIndex(); // a single-node cluster commits on its own
         }
         replicateToAllPeers();
         try {
@@ -435,7 +514,7 @@ public final class RaftNode implements RaftRpcHandler{
 
     private String leaderHint() {
         if (currentLeaderId == null) return null;
-        Integer leaderInt = currentLeaderId == null ? null : currentLeaderId.intValue();
+        Integer leaderInt = currentLeaderId.intValue();
         NodeConfig.PeerAddress peer = config.peers.get(leaderInt);
         return peer == null ? null : peer.host() + ":" + peer.port();
     }

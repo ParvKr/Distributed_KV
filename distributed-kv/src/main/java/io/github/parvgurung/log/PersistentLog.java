@@ -1,5 +1,7 @@
 package io.github.parvgurung.log;
 
+import io.github.parvgurung.util.FileUtil;
+
 import java.io.IOException;
 import java.io.RandomAccessFile;
 import java.nio.channels.FileChannel;
@@ -25,17 +27,26 @@ public final class PersistentLog implements AutoCloseable {
         Files.createDirectories(filePath.getParent());
         boolean existed = Files.exists(filePath);
         entries.add(null);
+        boolean tornTail = false;
         if (existed) {
-            for(String line : Files.readAllLines(filePath, StandardCharsets.UTF_8)) {
-                if(line.isBlank())
+            String content = Files.readString(filePath, StandardCharsets.UTF_8);
+            // Every append writes "<entry>\n" in one go, so a final segment without a newline is a
+            // write that was cut short by a crash. It was never acknowledged; drop it.
+            String[] lines = content.split("\n", -1);
+            tornTail = !lines[lines.length - 1].isEmpty();
+            for (int i = 0; i < lines.length - 1; i++) {
+                String line = lines[i];
+                if (line.isBlank())
                     continue;
                 LogEntry entry = LogEntry.deserialize(line);
                 long expectedIndex = entries.size();
-                if(entry.index() != expectedIndex)
+                if (entry.index() != expectedIndex)
                     throw new IllegalStateException("Log file is corrupted. Expected index " + expectedIndex + " but got " + entry.index());
                 entries.add(entry);
             }
-        } 
+        }
+        if (tornTail)
+            rewriteFile();
         raf = new RandomAccessFile(filePath.toFile(), "rw");
         raf.seek(raf.length());
         channel = raf.getChannel();
@@ -46,27 +57,43 @@ public final class PersistentLog implements AutoCloseable {
         if (entry.index() != expectedIndex)
             throw new IllegalArgumentException("Out-of-order append: expected index " + expectedIndex + " but got " + entry.index());
         String line = entry.serialize() + "\n";
-        raf.write(line.getBytes(StandardCharsets.UTF_8));
-        channel.force(true);
+        long startPos = raf.length();
+        try {
+            raf.write(line.getBytes(StandardCharsets.UTF_8));
+            channel.force(true);
+        } catch (IOException e) {
+            // Don't leave a partial line behind for the next append to be glued onto.
+            try {
+                raf.setLength(startPos);
+                raf.seek(startPos);
+            } catch (IOException ignored) {
+            }
+            throw e;
+        }
         entries.add(entry);
     }
 
     public synchronized void truncateFrom(long fromIndex) throws IOException {
+        if (fromIndex < 1)
+            throw new IllegalArgumentException("Cannot truncate from index " + fromIndex + "; indexes start at 1");
         if (fromIndex > lastIndex()) return;
         while (entries.size() > fromIndex) {
             entries.remove(entries.size() - 1);
         }
         channel.close();
         raf.close();
-        StringBuilder sb = new StringBuilder();
-        for (int i = 1; i < entries.size(); i++) {
-            LogEntry e = entries.get(i);
-            if (e != null) sb.append(e.serialize()).append('\n');
-        }
-        Files.writeString(filePath, sb.toString(), StandardCharsets.UTF_8);
+        rewriteFile();
         raf = new RandomAccessFile(filePath.toFile(), "rw");
         raf.seek(raf.length());
         channel = raf.getChannel();
+    }
+
+    private void rewriteFile() throws IOException {
+        StringBuilder sb = new StringBuilder();
+        for (int i = 1; i < entries.size(); i++) {
+            sb.append(entries.get(i).serialize()).append('\n');
+        }
+        FileUtil.writeAtomically(filePath, sb.toString().getBytes(StandardCharsets.UTF_8));
     }
 
     public synchronized Optional<LogEntry> get(long index) {

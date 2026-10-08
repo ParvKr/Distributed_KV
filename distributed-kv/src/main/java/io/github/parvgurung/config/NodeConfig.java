@@ -27,12 +27,16 @@ public final class NodeConfig {
     }
 
     private static int parsePositiveInt(String value, String field) {
+        final int parsed;
         try {
-            return Integer.parseInt(value);
+            parsed = Integer.parseInt(value);
         }
         catch(NumberFormatException e) {
             throw new IllegalArgumentException(field + " must be a positive integer, but got: " + value);
         }
+        if(parsed <= 0)
+            throw new IllegalArgumentException(field + " must be a positive integer, but got: " + value);
+        return parsed;
     }
 
     public static NodeConfig fromArgs(String[] args) {
@@ -43,7 +47,7 @@ public final class NodeConfig {
 
         for(String arg: args) {
             if(!arg.startsWith("--") || !arg.contains("="))
-                continue;
+                throw new IllegalArgumentException("Malformed argument: " + arg + ". Expected --name=value");
             var kv = arg.substring(2).split("=", 2);
             String key = kv[0];
             String value = kv[1];

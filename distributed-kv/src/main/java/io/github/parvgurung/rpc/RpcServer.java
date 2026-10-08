@@ -10,12 +10,14 @@ import java.net.InetSocketAddress;
 import java.net.URI;
 import java.nio.charset.StandardCharsets;
 import java.util.Map;
+import java.util.concurrent.ExecutorService;
 import java.util.concurrent.Executors;
 
 public class RpcServer {
     private final int port;
     private final RaftRpcHandler handler;
     private HttpServer server;
+    private ExecutorService executor;
 
     public RpcServer(int port, RaftRpcHandler handler) {
         this.port = port;
@@ -24,7 +26,8 @@ public class RpcServer {
 
     public void start() throws IOException {
         server = HttpServer.create(new InetSocketAddress(port), 0);
-        server.setExecutor(Executors.newFixedThreadPool(200));
+        executor = Executors.newFixedThreadPool(200);
+        server.setExecutor(executor);
         server.createContext("/raft/requestVote", this::handleRequestVote);
         server.createContext("/raft/appendEntries", this::handleAppendEntries);
         server.createContext("/client/get", this::handleClientGet);
@@ -37,6 +40,8 @@ public class RpcServer {
     public void stop() {
         if (server != null)
             server.stop(0);
+        if (executor != null)
+            executor.shutdownNow();
     }
 
     private void handleRequestVote(HttpExchange exchange) throws IOException {
@@ -60,6 +65,8 @@ public class RpcServer {
     private void handleClientGet(HttpExchange exchange) throws IOException {
         withErrorHandling(exchange, () -> {
             String key = queryParam(exchange.getRequestURI(), "key");
+            if (key == null || key.isEmpty())
+                throw new IllegalArgumentException("Missing 'key' query parameter");
             ClientResponse resp = handler.handleClientGet(key);
             writeJson(exchange, 200, resp.toJson());
         });
@@ -105,17 +112,19 @@ public class RpcServer {
     private void withErrorHandling(HttpExchange exchange, ThrowingRunnable action) throws IOException {
         try {
             action.run();
+        } catch(IllegalArgumentException e) {
+            // malformed JSON, missing or invalid fields: the caller's fault
+            writeError(exchange, 400, e);
         } catch(Exception e) {
-            String msg = "{\"error\":\"" + e.getMessage() + "\"}";
-            byte[] bytes = msg.getBytes(StandardCharsets.UTF_8);
-            exchange.getResponseHeaders().set("Content-Type", "application/json");
-            exchange.sendResponseHeaders(500, bytes.length);
-            try (OutputStream os = exchange.getResponseBody()) {
-                os.write(bytes);
-            }
+            writeError(exchange, 500, e);
         } finally {
             exchange.close();
         }
+    }
+
+    private void writeError(HttpExchange exchange, int status, Exception e) throws IOException {
+        String message = e.getMessage() == null ? e.getClass().getSimpleName() : e.getMessage();
+        writeJson(exchange, status, ClientResponse.error(message).toJson());
     }
 
     private String readBody(HttpExchange exchange) throws IOException {
