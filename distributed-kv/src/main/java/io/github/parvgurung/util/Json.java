@@ -119,6 +119,16 @@ public final class Json {
     }
 
     @SuppressWarnings("unchecked")
+    public static Map<String, Object> getMap(Map<?, ?> obj, String key) {
+        Object value = obj.get(key);
+        if(value == null)
+            return new LinkedHashMap<>();
+        if(!(value instanceof Map))
+            throw new IllegalArgumentException("Field '" + key + "' is not an object: " + value);
+        return (Map<String, Object>) value;
+    }
+
+    @SuppressWarnings("unchecked")
     public static List<Map<String, Object>> getMapList(Map<String, Object> obj, String key) {
         Object value = obj.get(key);
         if(value == null)

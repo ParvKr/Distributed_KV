@@ -30,10 +30,12 @@ public class RpcServer {
         server.setExecutor(executor);
         server.createContext("/raft/requestVote", this::handleRequestVote);
         server.createContext("/raft/appendEntries", this::handleAppendEntries);
+        server.createContext("/raft/installSnapshot", this::handleInstallSnapshot);
         server.createContext("/client/get", this::handleClientGet);
         server.createContext("/client/set", this::handleClientSet);
         server.createContext("/client/delete", this::handleClientDelete);
         server.createContext("/status", this::handleStatus);
+        server.createContext("/status.json", this::handleStatusJson);
         server.start();
     }
 
@@ -58,6 +60,15 @@ public class RpcServer {
             String body = readBody(exchange);
             AppendEntriesRequest req = AppendEntriesRequest.fromJson(body);
             AppendEntriesResponse resp = handler.handleAppendEntries(req);
+            writeJson(exchange, 200, resp.toJson());
+        });
+    }
+
+    private void handleInstallSnapshot(HttpExchange exchange) throws IOException {
+        withErrorHandling(exchange, () -> {
+            String body = readBody(exchange);
+            InstallSnapshotRequest req = InstallSnapshotRequest.fromJson(body);
+            InstallSnapshotResponse resp = handler.handleInstallSnapshot(req);
             writeJson(exchange, 200, resp.toJson());
         });
     }
@@ -106,6 +117,14 @@ public class RpcServer {
             try (OutputStream os = exchange.getResponseBody()) {
                 os.write(bytes);
             }
+        });
+    }
+
+    private void handleStatusJson(HttpExchange exchange) throws IOException {
+        withErrorHandling(exchange, () -> {
+            // Read-only and carries no secrets, so a dashboard served from elsewhere may poll it.
+            exchange.getResponseHeaders().set("Access-Control-Allow-Origin", "*");
+            writeJson(exchange, 200, handler.statusJson());
         });
     }
 

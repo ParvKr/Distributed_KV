@@ -38,6 +38,7 @@ class RaftClusterTest {
 
     private final List<RaftNode> nodes = new ArrayList<>();
     private final Map<Integer, Integer> portById = new HashMap<>();
+    private final Map<Integer, NodeConfig> configById = new HashMap<>();
     private final HttpClient http = HttpClient.newHttpClient();
 
     @AfterEach
@@ -264,6 +265,28 @@ class RaftClusterTest {
     }
 
     @Test
+    void statusJsonDescribesTheNode() throws Exception {
+        startCluster(3, 5);
+        RaftNode leader = awaitLeader();
+        for (int i = 0; i < 8; i++) assertTrue(post(leader, "/client/set", "key", "k" + i, "value", "v").success());
+        awaitCondition("leader to snapshot", () -> leader.snapshotIndex() > 0);
+
+        HttpResponse<String> r = http.send(HttpRequest.newBuilder(uri(leader, "/status.json")).GET().build(),
+            HttpResponse.BodyHandlers.ofString());
+
+        assertEquals(200, r.statusCode());
+        assertEquals("*", r.headers().firstValue("Access-Control-Allow-Origin").orElse(null));
+        Map<String, Object> status = Json.decode(r.body());
+        assertEquals("LEADER", status.get("role"));
+        assertEquals(leader.nodeId(), Json.getInt(status, "nodeId"));
+        assertEquals(leader.nodeId(), Json.getInt(status, "leaderId"));
+        assertEquals(8, Json.getInt(status, "keys"));
+        assertTrue(Json.getLong(status, "snapshotIndex") > 0);
+        assertEquals(5, Json.getInt(status, "snapshotThreshold"));
+        assertTrue(Json.getLong(status, "commitIndex") >= Json.getLong(status, "snapshotIndex"));
+    }
+
+    @Test
     void getWithoutKeyIsABadRequest() throws Exception {
         startCluster(3);
         RaftNode leader = awaitLeader();
@@ -281,6 +304,99 @@ class RaftClusterTest {
         assertThrows(IllegalArgumentException.class, () -> client.set("", "v"));
     }
 
+    // ---------------------------------------------------------------- snapshots
+
+    @Test
+    void logIsCompactedOnEveryNodeAndNoDataIsLost() throws Exception {
+        startCluster(3, 5);
+        RaftNode leader = awaitLeader();
+
+        for (int i = 0; i < 30; i++) {
+            ClientResponse r = post(leader, "/client/set", "key", "k" + i, "value", "v" + i);
+            assertTrue(r.success(), "write " + i + " failed: " + r.error());
+        }
+
+        awaitCondition("every node to compact its log", () -> nodes.stream().allMatch(n -> n.snapshotIndex() >= 20));
+        for (int i = 0; i < 30; i++) {
+            assertEquals("v" + i, awaitGet(leader, "k" + i));
+        }
+        for (RaftNode n : nodes) {
+            assertTrue(Files.exists(tempDir.resolve("node" + n.nodeId()).resolve("snapshot")));
+            long keptInLog = Files.readAllLines(tempDir.resolve("node" + n.nodeId()).resolve("raft.log")).size();
+            assertTrue(keptInLog < 15, "node " + n.nodeId() + " still holds " + keptInLog + " entries on disk");
+        }
+    }
+
+    @Test
+    void clusterRestartsFromSnapshotPlusLogTail() throws Exception {
+        startCluster(3, 5);
+        RaftNode leader = awaitLeader();
+        assertTrue(post(leader, "/client/set", "key", "contested", "value", "from-A", "clientId", "A", "seq", 1).success());
+        assertTrue(post(leader, "/client/set", "key", "contested", "value", "from-B", "clientId", "B", "seq", 1).success());
+        for (int i = 0; i < 20; i++) {
+            assertTrue(post(leader, "/client/set", "key", "k" + i, "value", "v" + i).success());
+        }
+        awaitCondition("every node to snapshot", () -> nodes.stream().allMatch(n -> n.snapshotIndex() >= 10));
+        long lastIndex = leader.lastLogIndex();
+        awaitAllNodesCommitted(lastIndex);
+
+        for (RaftNode n : nodes) n.shutdown();
+        nodes.clear();
+        startCluster(3, 5);
+
+        RaftNode newLeader = awaitLeader();
+        for (int i = 0; i < 20; i++) {
+            assertEquals("v" + i, awaitGet(newLeader, "k" + i));
+        }
+        assertEquals("from-B", awaitGet(newLeader, "contested"));
+        // A's retry must still be recognised as a duplicate: that knowledge lives in the snapshot now.
+        assertTrue(post(newLeader, "/client/set", "key", "contested", "value", "from-A", "clientId", "A", "seq", 1).success());
+        assertEquals("from-B", awaitGet(newLeader, "contested"));
+    }
+
+    @Test
+    void followerThatFellBehindTheCompactedLogCatchesUpViaSnapshot() throws Exception {
+        startCluster(3, 5);
+        RaftNode leader = awaitLeader();
+        RaftNode lagging = nodes.stream().filter(n -> n != leader).findFirst().orElseThrow();
+        assertTrue(post(leader, "/client/set", "key", "early", "value", "e").success());
+        awaitAllNodesCommitted(2);
+
+        lagging.shutdown();
+        for (int i = 0; i < 30; i++) {
+            ClientResponse r = post(leader, "/client/set", "key", "k" + i, "value", "v" + i);
+            assertTrue(r.success(), "write " + i + " failed: " + r.error());
+        }
+        // The leader has now compacted past everything the follower has.
+        awaitCondition("leader to compact beyond the lagging follower", () -> leader.snapshotIndex() > 5);
+
+        RaftNode revived = new RaftNode(configById.get(lagging.nodeId()));
+        nodes.set(nodes.indexOf(lagging), revived);
+        revived.start();
+
+        awaitCondition("revived follower to catch up", () -> revived.commitIndex() >= leader.commitIndex() && revived.snapshotIndex() > 0);
+        assertTrue(revived.statusSummary().contains("entries=31"), revived.statusSummary());
+        assertEquals(leader.lastLogIndex(), revived.lastLogIndex());
+    }
+
+    @Test
+    void snapshotsKeepWorkingThroughLeaderFailover() throws Exception {
+        startCluster(3, 5);
+        RaftNode oldLeader = awaitLeader();
+        for (int i = 0; i < 20; i++) {
+            assertTrue(post(oldLeader, "/client/set", "key", "k" + i, "value", "v" + i).success());
+        }
+        awaitCondition("every node to snapshot", () -> nodes.stream().allMatch(n -> n.snapshotIndex() >= 10));
+
+        oldLeader.shutdown();
+        RaftNode newLeader = awaitLeaderOtherThan(oldLeader);
+
+        for (int i = 0; i < 20; i++) {
+            assertEquals("v" + i, awaitGet(newLeader, "k" + i));
+        }
+        assertTrue(post(newLeader, "/client/set", "key", "after", "value", "failover").success());
+    }
+
     // ---------------------------------------------------------------- helpers
 
     private void seed(int nodeId, long term, LogEntry... entries) throws IOException {
@@ -294,6 +410,10 @@ class RaftClusterTest {
     }
 
     private void startCluster(int size) throws Exception {
+        startCluster(size, NodeConfig.DEFAULT_SNAPSHOT_THRESHOLD);
+    }
+
+    private void startCluster(int size, int snapshotThreshold) throws Exception {
         for (int id = 1; id <= size; id++) {
             if (!portById.containsKey(id)) portById.put(id, freePort());
         }
@@ -302,7 +422,9 @@ class RaftClusterTest {
             for (int other = 1; other <= size; other++) {
                 if (other != id) peers.put(other, new NodeConfig.PeerAddress(other, "localhost", portById.get(other)));
             }
-            RaftNode node = new RaftNode(new NodeConfig(id, portById.get(id), tempDir.resolve("node" + id), peers));
+            NodeConfig config = new NodeConfig(id, portById.get(id), tempDir.resolve("node" + id), peers, snapshotThreshold);
+            configById.put(id, config);
+            RaftNode node = new RaftNode(config);
             node.start();
             nodes.add(node);
         }

@@ -11,11 +11,23 @@ public final class NodeConfig {
 
     public final Map<Integer, PeerAddress> peers;
 
+    /** Take a snapshot once this many entries have been applied since the last one; 0 disables snapshots. */
+    public final int snapshotThreshold;
+
+    public static final int DEFAULT_SNAPSHOT_THRESHOLD = 1000;
+
     public NodeConfig(int nodeId, int port, Path dataDir, Map<Integer, PeerAddress> peers) {
+        this(nodeId, port, dataDir, peers, DEFAULT_SNAPSHOT_THRESHOLD);
+    }
+
+    public NodeConfig(int nodeId, int port, Path dataDir, Map<Integer, PeerAddress> peers, int snapshotThreshold) {
+        if (snapshotThreshold < 0)
+            throw new IllegalArgumentException("snapshotThreshold cannot be negative");
         this.nodeId = nodeId;
         this.port = port;
         this.dataDir = dataDir;
         this.peers = Map.copyOf(peers);
+        this.snapshotThreshold = snapshotThreshold;
     }
 
     public int clusterSize() {
@@ -43,6 +55,7 @@ public final class NodeConfig {
         Integer id = null;
         Integer port = null;
         Path dataDir = null;
+        int snapshotThreshold = DEFAULT_SNAPSHOT_THRESHOLD;
         Map<Integer, PeerAddress> peers = new HashMap<>();
 
         for(String arg: args) {
@@ -61,6 +74,15 @@ public final class NodeConfig {
                         throw new IllegalArgumentException("Port must be in the range 1024-65535");
                 }
                 case "dataDir" -> dataDir = Path.of(value).toAbsolutePath();
+                case "snapshotThreshold" -> {
+                    try {
+                        snapshotThreshold = Integer.parseInt(value);
+                    } catch(NumberFormatException e) {
+                        throw new IllegalArgumentException("snapshotThreshold must be a non-negative integer, but got: " + value);
+                    }
+                    if(snapshotThreshold < 0)
+                        throw new IllegalArgumentException("snapshotThreshold must be a non-negative integer, but got: " + value);
+                }
                 case "peers" -> {
                     if(!value.isBlank()) {
                         for(String peerSpec: value.split(",")) {
@@ -96,7 +118,7 @@ public final class NodeConfig {
         
         if(peers.containsKey(id))
             throw new IllegalArgumentException("Node ID cannot be the same as any peer ID: " + id);
-        return new NodeConfig(id, port, dataDir, peers);
+        return new NodeConfig(id, port, dataDir, peers, snapshotThreshold);
     }
 
     public record PeerAddress(int nodeId, String host, int port) {
@@ -108,6 +130,7 @@ public final class NodeConfig {
     @Override
     public String toString() {
         return "NodeConfig{" + "id=" + nodeId + ", port=" + port + ", dataDir='" + dataDir + '\'' + 
-        ", peers=" + peers.values() + ", clusterSize=" + clusterSize() + ", majority=" + majority() + '}';
+        ", peers=" + peers.values() + ", clusterSize=" + clusterSize() + ", majority=" + majority()
+        + ", snapshotThreshold=" + snapshotThreshold + '}';
     }
 }

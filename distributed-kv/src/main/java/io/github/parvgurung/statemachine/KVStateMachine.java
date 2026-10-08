@@ -1,5 +1,7 @@
 package io.github.parvgurung.statemachine;
 
+import java.util.HashMap;
+import java.util.Map;
 import java.util.Optional;
 import java.util.concurrent.ConcurrentHashMap;
 import java.util.concurrent.atomic.AtomicLong;
@@ -14,6 +16,22 @@ public class KVStateMachine {
 
     public Optional<String> get(String key) {
         return Optional.ofNullable(data.get(key));
+    }
+
+    /** A consistent copy of everything the state machine holds, as of {@code lastAppliedIndex}. */
+    public record State(long lastAppliedIndex, Map<String, String> data, Map<String, Long> sessions) {}
+
+    public synchronized State capture() {
+        return new State(lastAppliedIndex.get(), new HashMap<>(data), new HashMap<>(lastSeqByClient));
+    }
+
+    /** Replaces the whole state, e.g. from a snapshot. */
+    public synchronized void restore(State state) {
+        data.clear();
+        data.putAll(state.data());
+        lastSeqByClient.clear();
+        lastSeqByClient.putAll(state.sessions());
+        lastAppliedIndex.set(state.lastAppliedIndex());
     }
 
     public synchronized void apply(Command command, long logIndex) {

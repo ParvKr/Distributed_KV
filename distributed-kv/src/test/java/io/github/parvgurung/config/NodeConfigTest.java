@@ -24,4 +24,17 @@ class NodeConfigTest {
     void rejectsMalformedArgumentInsteadOfIgnoringIt() {
         assertThrows(IllegalArgumentException.class, () -> NodeConfig.fromArgs(new String[]{"--id", "1", "--port=8001"}));
     }
+
+    @Test
+    void snapshotThresholdDefaultsAndCanBeSetOrDisabled() {
+        assertEquals(1000, NodeConfig.fromArgs(new String[]{"--id=1", "--port=8001"}).snapshotThreshold);
+        assertEquals(50, NodeConfig.fromArgs(new String[]{"--id=1", "--port=8001", "--snapshotThreshold=50"}).snapshotThreshold);
+        assertEquals(0, NodeConfig.fromArgs(new String[]{"--id=1", "--port=8001", "--snapshotThreshold=0"}).snapshotThreshold);
+    }
+
+    @Test
+    void negativeOrNonNumericSnapshotThresholdIsRejected() {
+        assertThrows(IllegalArgumentException.class, () -> NodeConfig.fromArgs(new String[]{"--id=1", "--port=8001", "--snapshotThreshold=-1"}));
+        assertThrows(IllegalArgumentException.class, () -> NodeConfig.fromArgs(new String[]{"--id=1", "--port=8001", "--snapshotThreshold=lots"}));
+    }
 }
