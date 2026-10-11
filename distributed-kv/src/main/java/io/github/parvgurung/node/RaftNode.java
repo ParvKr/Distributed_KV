@@ -100,7 +100,7 @@ public final class RaftNode implements RaftRpcHandler{
         } else {
             log.init();
         }
-        rpcServer = new RpcServer(config.port, this);
+        rpcServer = new RpcServer(config.port, this, config.allowOrigin, config.trustedBrowserOrigins());
         rpcServer.start();
         electionTimer.start();
     }
@@ -716,6 +716,14 @@ public final class RaftNode implements RaftRpcHandler{
         obj.put("snapshotIndex", log.snapshotIndex());
         obj.put("snapshotThreshold", config.snapshotThreshold);
         obj.put("keys", stateMachine.size());
+        List<Object> peerList = new ArrayList<>();
+        for (NodeConfig.PeerAddress peer : config.peers.values()) {
+            Map<String, Object> p = new LinkedHashMap<>();
+            p.put("id", peer.nodeId());
+            p.put("address", peer.host() + ":" + peer.port());
+            peerList.add(p);
+        }
+        obj.put("peers", peerList);
         return Json.encode(obj);
     }
 

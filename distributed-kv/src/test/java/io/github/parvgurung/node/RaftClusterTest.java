@@ -283,7 +283,43 @@ class RaftClusterTest {
         assertEquals(8, Json.getInt(status, "keys"));
         assertTrue(Json.getLong(status, "snapshotIndex") > 0);
         assertEquals(5, Json.getInt(status, "snapshotThreshold"));
+        @SuppressWarnings("unchecked")
+        List<Map<String, Object>> peers = (List<Map<String, Object>>) (List<?>) status.get("peers");
+        assertEquals(2, peers.size());
+        for (Map<String, Object> peer : peers) {
+            int id = Json.getInt(peer, "id");
+            assertNotEquals(leader.nodeId(), id);
+            assertEquals("localhost:" + portById.get(id), peer.get("address"));
+        }
         assertTrue(Json.getLong(status, "commitIndex") >= Json.getLong(status, "snapshotIndex"));
+    }
+
+    @Test
+    void dashboardPageIsServedByEveryNode() throws Exception {
+        startCluster(3);
+        awaitLeader();
+        for (RaftNode n : nodes) {
+            HttpResponse<String> r = http.send(HttpRequest.newBuilder(uri(n, "/dashboard")).GET().build(),
+                HttpResponse.BodyHandlers.ofString());
+            assertEquals(200, r.statusCode());
+            assertTrue(r.headers().firstValue("Content-Type").orElse("").startsWith("text/html"));
+            assertTrue(r.body().contains("<title>Raft cluster</title>"));
+            assertTrue(r.body().contains("/status.json"), "the page should poll the status endpoint");
+        }
+    }
+
+    @Test
+    void rootRedirectsToTheDashboardAndOtherUnknownPathsAre404() throws Exception {
+        startCluster(1);
+        RaftNode node = awaitLeader();
+        HttpResponse<String> root = http.send(HttpRequest.newBuilder(uri(node, "/")).GET().build(),
+            HttpResponse.BodyHandlers.ofString());
+        assertEquals(302, root.statusCode());
+        assertEquals("/dashboard", root.headers().firstValue("Location").orElse(null));
+
+        HttpResponse<String> unknown = http.send(HttpRequest.newBuilder(uri(node, "/nope")).GET().build(),
+            HttpResponse.BodyHandlers.ofString());
+        assertEquals(404, unknown.statusCode());
     }
 
     @Test

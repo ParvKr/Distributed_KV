@@ -10,6 +10,7 @@ import java.net.InetSocketAddress;
 import java.net.URI;
 import java.nio.charset.StandardCharsets;
 import java.util.Map;
+import java.util.Set;
 import java.util.concurrent.ExecutorService;
 import java.util.concurrent.Executors;
 
@@ -19,9 +20,22 @@ public class RpcServer {
     private HttpServer server;
     private ExecutorService executor;
 
+    private final String allowOrigin;
+    private final Set<String> trustedOrigins;
+
     public RpcServer(int port, RaftRpcHandler handler) {
+        this(port, handler, null, Set.of());
+    }
+
+    /**
+     * @param allowOrigin    a web origin (or "*") browsers may call the client endpoints from; null for none
+     * @param trustedOrigins further origins allowed to do the same, e.g. the other cluster nodes
+     */
+    public RpcServer(int port, RaftRpcHandler handler, String allowOrigin, Set<String> trustedOrigins) {
         this.port = port;
         this.handler = handler;
+        this.allowOrigin = allowOrigin;
+        this.trustedOrigins = Set.copyOf(trustedOrigins);
     }
 
     public void start() throws IOException {
@@ -31,11 +45,13 @@ public class RpcServer {
         server.createContext("/raft/requestVote", this::handleRequestVote);
         server.createContext("/raft/appendEntries", this::handleAppendEntries);
         server.createContext("/raft/installSnapshot", this::handleInstallSnapshot);
-        server.createContext("/client/get", this::handleClientGet);
-        server.createContext("/client/set", this::handleClientSet);
-        server.createContext("/client/delete", this::handleClientDelete);
+        server.createContext("/client/get", ex -> withClientCors(ex, this::handleClientGet));
+        server.createContext("/client/set", ex -> withClientCors(ex, this::handleClientSet));
+        server.createContext("/client/delete", ex -> withClientCors(ex, this::handleClientDelete));
         server.createContext("/status", this::handleStatus);
         server.createContext("/status.json", this::handleStatusJson);
+        server.createContext("/dashboard", this::handleDashboard);
+        server.createContext("/", this::handleRoot);
         server.start();
     }
 
@@ -73,8 +89,64 @@ public class RpcServer {
         });
     }
 
+    private interface ExchangeHandler {
+        void handle(HttpExchange exchange) throws IOException;
+    }
+
+    /**
+     * Lets a browser page from the configured origin call the client endpoints, and answers its preflight
+     * check. With no origin configured no CORS headers are sent, so browsers keep other sites out.
+     */
+    private void withClientCors(HttpExchange exchange, ExchangeHandler next) throws IOException {
+        String allowed = corsOriginFor(exchange.getRequestHeaders().getFirst("Origin"));
+        if (allowed != null) {
+            exchange.getResponseHeaders().set("Access-Control-Allow-Origin", allowed);
+            if (!allowed.equals("*"))
+                exchange.getResponseHeaders().add("Vary", "Origin");
+            if ("OPTIONS".equals(exchange.getRequestMethod())) {
+                exchange.getResponseHeaders().set("Access-Control-Allow-Methods", "GET, POST, OPTIONS");
+                exchange.getResponseHeaders().set("Access-Control-Allow-Headers", "Content-Type");
+                exchange.getResponseHeaders().set("Access-Control-Max-Age", "600");
+                exchange.sendResponseHeaders(204, -1);
+                exchange.close();
+                return;
+            }
+        }
+        next.handle(exchange);
+    }
+
+    /** The value for Access-Control-Allow-Origin, or null if a page from {@code origin} gets no access. */
+    private String corsOriginFor(String origin) {
+        if ("*".equals(allowOrigin))
+            return "*";
+        if (origin != null && (origin.equals(allowOrigin) || trustedOrigins.contains(origin)))
+            return origin;
+        return null;
+    }
+
+    /**
+     * Writes must be JSON POSTs. Requiring that content type means a web page on another site cannot
+     * submit a write (a plain form or text/plain request) without first passing the CORS preflight.
+     */
+    private boolean rejectUnlessJsonPost(HttpExchange exchange) throws IOException {
+        if (!"POST".equals(exchange.getRequestMethod())) {
+            writeJson(exchange, 405, ClientResponse.error("Use POST").toJson());
+            return true;
+        }
+        String contentType = exchange.getRequestHeaders().getFirst("Content-Type");
+        if (contentType == null || !contentType.toLowerCase().startsWith("application/json")) {
+            writeJson(exchange, 415, ClientResponse.error("Content-Type must be application/json").toJson());
+            return true;
+        }
+        return false;
+    }
+
     private void handleClientGet(HttpExchange exchange) throws IOException {
         withErrorHandling(exchange, () -> {
+            if (!"GET".equals(exchange.getRequestMethod())) {
+                writeJson(exchange, 405, ClientResponse.error("Use GET").toJson());
+                return;
+            }
             String key = queryParam(exchange.getRequestURI(), "key");
             if (key == null || key.isEmpty())
                 throw new IllegalArgumentException("Missing 'key' query parameter");
@@ -85,6 +157,7 @@ public class RpcServer {
 
     private void handleClientSet(HttpExchange exchange) throws IOException {
         withErrorHandling(exchange, () -> {
+            if (rejectUnlessJsonPost(exchange)) return;
             String body = readBody(exchange);
             Map<String, Object> obj = Json.decode(body);
             String key = Json.getString(obj, "key");
@@ -96,6 +169,7 @@ public class RpcServer {
 
     private void handleClientDelete(HttpExchange exchange) throws IOException {
         withErrorHandling(exchange, () -> {
+            if (rejectUnlessJsonPost(exchange)) return;
             String body = readBody(exchange);
             Map<String, Object> obj = Json.decode(body);
             String key = Json.getString(obj, "key");
@@ -116,6 +190,34 @@ public class RpcServer {
             exchange.sendResponseHeaders(200, bytes.length);
             try (OutputStream os = exchange.getResponseBody()) {
                 os.write(bytes);
+            }
+        });
+    }
+
+    private void handleDashboard(HttpExchange exchange) throws IOException {
+        withErrorHandling(exchange, () -> {
+            try (var page = RpcServer.class.getResourceAsStream("/dashboard/index.html")) {
+                if (page == null)
+                    throw new IOException("dashboard page is missing from the build");
+                byte[] bytes = page.readAllBytes();
+                exchange.getResponseHeaders().set("Content-Type", "text/html; charset=UTF-8");
+                exchange.getResponseHeaders().set("Cache-Control", "no-cache");
+                exchange.sendResponseHeaders(200, bytes.length);
+                try (OutputStream os = exchange.getResponseBody()) {
+                    os.write(bytes);
+                }
+            }
+        });
+    }
+
+    // Only "/" itself goes to the dashboard; every other unknown path is a plain 404.
+    private void handleRoot(HttpExchange exchange) throws IOException {
+        withErrorHandling(exchange, () -> {
+            if (exchange.getRequestURI().getPath().equals("/")) {
+                exchange.getResponseHeaders().set("Location", "/dashboard");
+                exchange.sendResponseHeaders(302, -1);
+            } else {
+                exchange.sendResponseHeaders(404, -1);
             }
         });
     }

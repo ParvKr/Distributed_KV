@@ -2,7 +2,9 @@ package io.github.parvgurung.config;
 
 import java.nio.file.Path;
 import java.util.HashMap;
+import java.util.LinkedHashSet;
 import java.util.Map;
+import java.util.Set;
 
 public final class NodeConfig {
     public final int nodeId;
@@ -16,18 +18,48 @@ public final class NodeConfig {
 
     public static final int DEFAULT_SNAPSHOT_THRESHOLD = 1000;
 
+    /**
+     * The one web origin (or "*") allowed to call the client endpoints from a browser, or null to allow
+     * none. A dashboard served by the node itself is same-origin and needs no setting.
+     */
+    public final String allowOrigin;
+
     public NodeConfig(int nodeId, int port, Path dataDir, Map<Integer, PeerAddress> peers) {
         this(nodeId, port, dataDir, peers, DEFAULT_SNAPSHOT_THRESHOLD);
     }
 
     public NodeConfig(int nodeId, int port, Path dataDir, Map<Integer, PeerAddress> peers, int snapshotThreshold) {
+        this(nodeId, port, dataDir, peers, snapshotThreshold, null);
+    }
+
+    public NodeConfig(int nodeId, int port, Path dataDir, Map<Integer, PeerAddress> peers, int snapshotThreshold, String allowOrigin) {
         if (snapshotThreshold < 0)
             throw new IllegalArgumentException("snapshotThreshold cannot be negative");
+        if (allowOrigin != null && !allowOrigin.equals("*") && !allowOrigin.matches("https?://[^/\\s]+"))
+            throw new IllegalArgumentException("allowOrigin must be \"*\" or an origin like https://example.com (no path), but got: " + allowOrigin);
+        this.allowOrigin = allowOrigin;
         this.nodeId = nodeId;
         this.port = port;
         this.dataDir = dataDir;
         this.peers = Map.copyOf(peers);
         this.snapshotThreshold = snapshotThreshold;
+    }
+
+    /**
+     * Web origins of the other cluster nodes. A dashboard page served by one node calls the others from
+     * the browser, so each node trusts its peers' origins (and the loopback spellings of them).
+     */
+    public Set<String> trustedBrowserOrigins() {
+        Set<String> origins = new LinkedHashSet<>();
+        for (PeerAddress peer : peers.values()) {
+            origins.add("http://" + peer.host() + ":" + peer.port());
+            if (peer.host().equals("localhost") || peer.host().equals("127.0.0.1") || peer.host().equals("[::1]")) {
+                origins.add("http://localhost:" + peer.port());
+                origins.add("http://127.0.0.1:" + peer.port());
+                origins.add("http://[::1]:" + peer.port());
+            }
+        }
+        return origins;
     }
 
     public int clusterSize() {
@@ -56,6 +88,7 @@ public final class NodeConfig {
         Integer port = null;
         Path dataDir = null;
         int snapshotThreshold = DEFAULT_SNAPSHOT_THRESHOLD;
+        String allowOrigin = null;
         Map<Integer, PeerAddress> peers = new HashMap<>();
 
         for(String arg: args) {
@@ -74,6 +107,7 @@ public final class NodeConfig {
                         throw new IllegalArgumentException("Port must be in the range 1024-65535");
                 }
                 case "dataDir" -> dataDir = Path.of(value).toAbsolutePath();
+                case "allowOrigin" -> allowOrigin = value;
                 case "snapshotThreshold" -> {
                     try {
                         snapshotThreshold = Integer.parseInt(value);
@@ -118,7 +152,7 @@ public final class NodeConfig {
         
         if(peers.containsKey(id))
             throw new IllegalArgumentException("Node ID cannot be the same as any peer ID: " + id);
-        return new NodeConfig(id, port, dataDir, peers, snapshotThreshold);
+        return new NodeConfig(id, port, dataDir, peers, snapshotThreshold, allowOrigin);
     }
 
     public record PeerAddress(int nodeId, String host, int port) {
@@ -131,6 +165,6 @@ public final class NodeConfig {
     public String toString() {
         return "NodeConfig{" + "id=" + nodeId + ", port=" + port + ", dataDir='" + dataDir + '\'' + 
         ", peers=" + peers.values() + ", clusterSize=" + clusterSize() + ", majority=" + majority()
-        + ", snapshotThreshold=" + snapshotThreshold + '}';
+        + ", snapshotThreshold=" + snapshotThreshold + ", allowOrigin=" + allowOrigin + '}';
     }
 }

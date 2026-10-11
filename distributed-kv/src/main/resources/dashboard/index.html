@@ -1,0 +1,631 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Raft cluster</title>
+<style>
+  :root {
+    --ground: #edeff2;
+    --panel: #f8f9fb;
+    --ink: #1c2633;
+    --muted: #5b6878;
+    --rule: #cbd2da;
+    --leader: #0e6e66;
+    --leader-tint: #e3f0ee;
+    --commit: #2c5b8f;
+    --pending: #d08a2a;
+    --snap: #8b97a6;
+    --down: #b23a2e;
+    --focus: #1d4ed8;
+  }
+  @media (prefers-color-scheme: dark) {
+    :root {
+      --ground: #12171d;
+      --panel: #1a212a;
+      --ink: #e6eaf0;
+      --muted: #93a0b0;
+      --rule: #2b3541;
+      --leader: #3cc4b5;
+      --leader-tint: #16302f;
+      --commit: #6fa3dc;
+      --pending: #e0a246;
+      --snap: #6a7787;
+      --down: #ef7a6c;
+      --focus: #8ab4ff;
+    }
+  }
+  * { box-sizing: border-box; }
+  body {
+    margin: 0;
+    background: var(--ground);
+    color: var(--ink);
+    font: 16px/1.45 "Avenir Next", "Segoe UI Variable Text", "Segoe UI", system-ui, sans-serif;
+    font-variant-numeric: tabular-nums;
+  }
+  main { max-width: 68rem; margin: 0 auto; padding: 2.5rem 1rem 4rem; }
+
+  header { display: flex; justify-content: space-between; align-items: flex-start; gap: 1rem; flex-wrap: wrap; }
+  h1 { margin: 0; font-size: clamp(1.7rem, 4vw, 2.4rem); line-height: 1.15; font-weight: 650; letter-spacing: -0.02em; }
+  .sub { margin: .35rem 0 0; color: var(--muted); max-width: 40rem; }
+  button {
+    font: inherit; color: var(--ink); background: var(--panel);
+    border: 1px solid var(--rule); border-radius: 6px; padding: .4rem .8rem; cursor: pointer;
+  }
+  button:hover { border-color: var(--muted); }
+  :focus-visible { outline: 3px solid var(--focus); outline-offset: 2px; }
+
+  .banner { margin: 0 0 1.5rem; padding: .7rem .9rem; border: 1px solid var(--pending); border-left-width: 4px; border-radius: 4px; background: var(--panel); max-width: 46rem; }
+  .banner a, .lost a { color: inherit; }
+  .lost { margin: 1.5rem 0 0; color: var(--muted); }
+  .lost code { font: inherit; font-weight: 600; color: var(--ink); }
+  [hidden] { display: none !important; }
+  .connect { margin-top: 1.25rem; max-width: 46rem; }
+  .connect summary { cursor: pointer; color: var(--muted); width: fit-content; padding: .2rem 0; }
+  .connect summary:hover { color: var(--ink); }
+  .connect form { margin-top: .6rem; padding: .9rem 1rem 1rem; border: 1px solid var(--rule); border-radius: 6px; background: var(--panel); }
+  .connect label { font-weight: 600; display: block; margin-bottom: .35rem; }
+  .connect .row { display: flex; gap: .5rem; }
+  .connect input {
+    flex: 1; min-width: 0; font: inherit; color: var(--ink); background: var(--ground);
+    border: 1px solid var(--rule); border-radius: 6px; padding: .5rem .7rem;
+  }
+  .connect input::placeholder { color: var(--muted); opacity: .8; }
+  .connect button[type="submit"] { background: var(--ink); color: var(--ground); border-color: var(--ink); font-weight: 600; }
+  .connect .help { margin: .5rem 0 0; color: var(--muted); font-size: .88rem; }
+  .connect .error { margin: .5rem 0 0; color: var(--down); font-weight: 550; }
+  .legend { display: flex; flex-wrap: wrap; gap: .4rem 1.4rem; margin: 2rem 0 .6rem; color: var(--muted); font-size: .88rem; }
+  .legend span { display: inline-flex; align-items: center; gap: .45rem; }
+  .swatch { width: 1.4rem; height: .8rem; border-radius: 2px; display: inline-block; }
+  .swatch.snap { background: repeating-linear-gradient(135deg, var(--snap) 0 2px, transparent 2px 5px); border: 1px solid var(--snap); }
+  .swatch.commit { background: var(--commit); }
+  .swatch.pending { background: var(--pending); }
+
+  .nodes { border-top: 1px solid var(--rule); }
+  .node {
+    display: grid; grid-template-columns: 12rem minmax(0, 1fr) 17rem; gap: 1.5rem; align-items: center;
+    padding: 1.15rem .75rem 1.15rem 1rem; border-bottom: 1px solid var(--rule);
+    border-left: 4px solid transparent;
+  }
+  .node.leader { background: var(--leader-tint); border-left-color: var(--leader); }
+  .node.down .tape-wrap, .node.down .stats { opacity: .4; }
+  .name { font-size: 1.15rem; font-weight: 650; }
+  .role { display: flex; align-items: center; gap: .5rem; margin-top: .15rem; font-weight: 550; }
+  .mark { width: .8rem; height: .8rem; border-radius: 50%; border: 2px solid var(--muted); flex: none; }
+  .leader .mark { background: var(--leader); border-color: var(--leader); box-shadow: 0 0 0 3px var(--leader-tint), 0 0 0 4px var(--leader); }
+  .candidate .mark { border-color: var(--pending); background: linear-gradient(90deg, var(--pending) 50%, transparent 50%); }
+  .down .mark { border-color: var(--down); background: var(--down); clip-path: polygon(0 0, 100% 0, 50% 100%); border-radius: 0; }
+  .down .role { color: var(--down); }
+  .addr { margin-top: .2rem; font-size: .85rem; color: var(--muted); overflow-wrap: anywhere; }
+  .addr a { color: inherit; }
+
+  .tape { position: relative; height: 1.9rem; border: 1px solid var(--rule); border-radius: 4px; background: var(--panel); overflow: hidden; }
+  .seg { position: absolute; top: 0; bottom: 0; transition: left .3s, width .3s; }
+  .seg.snap { background: repeating-linear-gradient(135deg, var(--snap) 0 2px, transparent 2px 5px); }
+  .seg.commit { background: var(--commit); }
+  .seg.pending { background: var(--pending); }
+  .tape-note { margin-top: .35rem; font-size: .85rem; color: var(--muted); min-height: 1.2em; }
+  .node.down .tape-note { opacity: 1; color: var(--down); }
+
+  .stats { display: grid; grid-template-columns: repeat(3, 1fr); gap: .6rem .5rem; margin: 0; }
+  .stats div { min-width: 0; }
+  .stats dt { font-size: .78rem; color: var(--muted); }
+  .stats dd { margin: 0; font-size: 1.15rem; font-weight: 650; }
+
+  .console { margin-top: 2.5rem; max-width: 46rem; }
+  .console h2 { margin: 0 0 .6rem; font-size: 1.15rem; }
+  .console .fields { display: flex; flex-wrap: wrap; gap: .75rem; }
+  .console .fields > div { flex: 1 1 14rem; min-width: 0; }
+  .console label { display: block; font-weight: 600; margin-bottom: .3rem; }
+  .console input {
+    width: 100%; font: inherit; color: var(--ink); background: var(--panel);
+    border: 1px solid var(--rule); border-radius: 6px; padding: .5rem .7rem;
+  }
+  .console .actions { display: flex; gap: .5rem; margin-top: .75rem; }
+  button.primary { background: var(--ink); color: var(--ground); border-color: var(--ink); font-weight: 600; }
+  button:disabled { opacity: .55; cursor: progress; }
+  .console .result { margin: .75rem 0 0; min-height: 1.5em; overflow-wrap: anywhere; }
+  .console .result.error { color: var(--down); font-weight: 550; }
+  .events { margin-top: 2.5rem; }
+  .events h2 { margin: 0 0 .6rem; font-size: 1.15rem; }
+  .events ol { list-style: none; margin: 0; padding: 0; border-top: 1px solid var(--rule); }
+  .events li { display: grid; grid-template-columns: 5.5rem 1fr; gap: 1rem; padding: .55rem 0; border-bottom: 1px solid var(--rule); }
+  .events time { color: var(--muted); font-size: .9rem; }
+  .events .empty { color: var(--muted); padding: .8rem 0; border-bottom: 1px solid var(--rule); }
+
+  @media (max-width: 52rem) {
+    .node { grid-template-columns: 1fr; gap: .8rem; }
+    .stats { grid-template-columns: repeat(5, 1fr); }
+  }
+  @media (max-width: 34rem) { .stats { grid-template-columns: repeat(3, 1fr); } }
+  @media (prefers-reduced-motion: reduce) { .seg { transition: none; } }
+</style>
+</head>
+<body>
+<main>
+  <p class="banner" id="demo-banner" hidden>This is a simulated cluster, not live data. It plays a repeating scenario: a follower drops out and catches up through a snapshot, then the leader fails and a new one is elected. <a href="?">Open the live view</a></p>
+  <header>
+    <div>
+      <h1 id="headline">Connecting to the cluster</h1>
+      <p class="sub" id="subline">Asking this node who else is in the cluster.</p>
+    </div>
+    <button id="pause" type="button" aria-pressed="false">Pause updates</button>
+  </header>
+
+  <details class="connect" id="connect">
+    <summary>Choose nodes to watch</summary>
+    <form id="connect-form" novalidate>
+      <label for="addresses">Node addresses</label>
+      <div class="row">
+        <input id="addresses" name="addresses" type="text" autocomplete="off" spellcheck="false"
+               placeholder="localhost:8001, localhost:8002, localhost:8003" aria-describedby="addresses-help addresses-error">
+        <button type="submit">Connect</button>
+      </div>
+      <p class="help" id="addresses-help">Separate addresses with commas. Each one is a node's host and port. Nodes must be reachable from this browser.</p>
+      <p class="error" id="addresses-error" role="alert" hidden></p>
+    </form>
+  </details>
+
+  <p class="lost" id="lost" hidden>No nodes to show yet. Enter your node addresses above, or watch a <a href="?demo">simulated cluster</a> first. Nodes also serve this page themselves at <code>/dashboard</code>.</p>
+
+  <div class="legend" id="legend" aria-label="How to read each log bar">
+    <span><i class="swatch snap"></i>Folded into a snapshot</span>
+    <span><i class="swatch commit"></i>Committed entries</span>
+    <span><i class="swatch pending"></i>Waiting for a majority</span>
+  </div>
+
+  <section class="nodes" id="nodes" aria-label="Nodes"></section>
+
+  <section class="console" id="console" aria-labelledby="console-title">
+    <h2 id="console-title">Read and write data</h2>
+    <form id="console-form" novalidate>
+      <div class="fields">
+        <div><label for="kv-key">Key</label><input id="kv-key" type="text" autocomplete="off" spellcheck="false"></div>
+        <div><label for="kv-value">Value</label><input id="kv-value" type="text" autocomplete="off" spellcheck="false"></div>
+      </div>
+      <div class="actions">
+        <button type="submit" id="kv-set" class="primary">Set</button>
+        <button type="button" id="kv-get">Get</button>
+        <button type="button" id="kv-delete">Delete</button>
+      </div>
+    </form>
+    <p class="result" id="kv-result" role="status"></p>
+  </section>
+
+  <section class="events" id="events-section">
+    <h2>What changed</h2>
+    <ol id="events" aria-live="polite"></ol>
+  </section>
+</main>
+
+<script>
+(() => {
+  const POLL_MS = 1000, TIMEOUT_MS = 900, MAX_EVENTS = 40, GIVE_UP_AFTER = 3;
+  const params = new URLSearchParams(location.search);
+  const demo = params.has("demo");
+  const parseAddresses = text => text.split(/[,\s]+/).map(x => x.trim()).filter(Boolean);
+  let explicit = !demo && params.get("nodes") ? parseAddresses(params.get("nodes")) : null;
+  const SAVED_KEY = "raft-dashboard-nodes";
+
+  const nodes = new Map();          // node id (or a placeholder key until the id is known) -> entry
+  const events = [];
+  let paused = false, lastLeaderKey = null, hadLeader = false, started = false, polls = 0, everAnswered = false;
+  let generation = 0;   // bumped whenever the node list is replaced, so replies for the old list are dropped
+
+  // ---- where nodes live -------------------------------------------------------------------------
+  const isLocal = host => /^(localhost|127\.\d+\.\d+\.\d+|\[::1\])(:\d+)?$/.test(host);
+  // Browsers block an https page from calling plain http, except for localhost, so follow the page.
+  function baseUrl(address) {
+    if (/^https?:\/\//.test(address)) return address.replace(/\/+$/, "");
+    const scheme = location.protocol === "https:" && !isLocal(address) ? "https" : "http";
+    return scheme + "://" + address;
+  }
+  const shown = address => address.replace(/^https?:\/\//, "");
+
+  function addPlaceholder(key, address, isSelf = false) {
+    nodes.set(key, { id: null, address, status: null, up: null, lastSeen: null, isSelf });
+  }
+  function resetNodes() {
+    nodes.clear();
+    if (demo) {
+      for (let id = 1; id <= 3; id++) nodes.set(id, { id, address: "demo-node-" + id, status: null, up: null, lastSeen: null });
+    } else if (explicit) {
+      explicit.forEach((a, i) => addPlaceholder("given" + i, a));
+    } else {
+      addPlaceholder("self", location.host, true);
+    }
+  }
+  resetNodes();
+
+  const $ = id => document.getElementById(id);
+  // Until a node answers we don't know its id, so name it by where it lives.
+  const label = n => n.id != null ? "Node " + n.id : n.isSelf ? "This node" : shown(n.address);
+
+  function addEvent(text) {
+    events.unshift({ at: Date.now(), text });
+    if (events.length > MAX_EVENTS) events.pop();
+  }
+
+  // ---- a simulated cluster for ?demo ------------------------------------------------------------
+  const Demo = (() => {
+    const THRESHOLD = 10, CYCLE = 48;
+    const sim = [1, 2, 3].map(id => ({ id, up: true, role: "FOLLOWER", term: 0, last: 0, commit: 0, snap: 0, keys: 0 }));
+    let tickNo = 0, stoppedFollower = null, stoppedLeader = null;
+    const leader = () => sim.find(n => n.up && n.role === "LEADER");
+    const stop = n => { n.up = false; };
+    const catchUp = n => {
+      const l = leader();
+      if (!l) return;
+      n.up = true; n.role = "FOLLOWER"; n.term = l.term;
+      n.snap = l.snap; n.last = l.last; n.commit = l.commit; n.keys = l.keys;
+    };
+    function elect(n) {
+      const term = Math.max(...sim.map(x => x.term)) + 1;
+      sim.forEach(x => { if (x.up) { x.term = term; x.role = "FOLLOWER"; } });
+      n.role = "LEADER";
+      n.last += 1;                               // the new leader's no-op entry
+    }
+    function tick() {
+      const phase = tickNo % CYCLE;
+      if (tickNo === 1) elect(sim[1]);
+      if (phase === 12 && leader()) { stoppedFollower = sim.find(n => n.up && n.role !== "LEADER"); stop(stoppedFollower); }
+      if (phase === 28 && stoppedFollower) { catchUp(stoppedFollower); stoppedFollower = null; }
+      if (phase === 36 && leader()) { stoppedLeader = leader(); stop(stoppedLeader); stoppedLeader.role = "FOLLOWER"; }
+      if (phase === 39 && !leader()) elect(sim.find(n => n.up));
+      if (phase === 45 && stoppedLeader) { catchUp(stoppedLeader); stoppedLeader = null; }
+
+      const l = leader();
+      if (l) {
+        l.commit = l.last;                       // everything the leader had last tick is now committed
+        l.last += 1; l.keys += 1;                // one new client write per tick
+        for (const n of sim) {
+          if (!n.up || n === l) continue;
+          n.last = l.last - 1; n.commit = l.commit; n.keys = l.keys;
+        }
+        for (const n of sim) {
+          if (n.up && n.commit - n.snap >= THRESHOLD) n.snap = n.commit;
+        }
+      }
+      tickNo++;
+    }
+    function status(id) {
+      const n = sim[id - 1];
+      if (!n.up) throw new Error("down");
+      return {
+        nodeId: n.id, role: n.role, term: n.term, leaderId: null,
+        lastLogIndex: n.last, lastLogTerm: n.term, commitIndex: n.commit, lastApplied: n.commit,
+        snapshotIndex: n.snap, snapshotThreshold: THRESHOLD, keys: n.keys,
+        peers: sim.filter(x => x !== n).map(x => ({ id: x.id, address: "demo-node-" + x.id }))
+      };
+    }
+    return { tick, status };
+  })();
+
+  // ---- polling ----------------------------------------------------------------------------------
+  async function fetchStatus(entry) {
+    if (demo) return Demo.status(entry.id);
+    const ctl = new AbortController();
+    const timer = setTimeout(() => ctl.abort(), TIMEOUT_MS);
+    try {
+      const res = await fetch(baseUrl(entry.address) + "/status.json", { signal: ctl.signal, cache: "no-store" });
+      if (!res.ok) throw new Error("HTTP " + res.status);
+      return await res.json();
+    } finally { clearTimeout(timer); }
+  }
+
+  function adopt(entry, status) {
+    // Once a node reports its id, key it by id so one node found twice (via the address in the link and
+    // via another node's peer list) is shown once.
+    const id = status.nodeId;
+    if (entry.id === id) return;
+    entry.id = id;
+    for (const [key, other] of [...nodes]) {
+      if (other === entry || other.id === id) nodes.delete(key);
+    }
+    nodes.set(id, entry);
+  }
+
+  async function pollOnce() {
+    if (demo) Demo.tick();
+    polls++;
+    const gen = generation;
+    await Promise.all([...nodes.values()].map(async entry => {
+      const before = { up: entry.up, status: entry.status };
+      try {
+        const status = await fetchStatus(entry);
+        if (gen !== generation) return;
+        entry.status = status; entry.up = true; entry.lastSeen = Date.now(); everAnswered = true;
+        adopt(entry, status);
+        if (!explicit) {
+          for (const p of status.peers || []) {
+            if (!nodes.has(p.id)) nodes.set(p.id, { id: p.id, address: p.address, status: null, up: null, lastSeen: null });
+          }
+        }
+        if (before.up === false) addEvent(label(entry) + " is responding again.");
+        if (before.status && status.snapshotIndex > before.status.snapshotIndex)
+          addEvent(label(entry) + " compacted its log through entry " + status.snapshotIndex + ".");
+      } catch (e) {
+        if (gen !== generation) return;
+        entry.up = false;
+        if (before.up === true) addEvent(label(entry) + " stopped responding.");
+      }
+    }));
+    if (gen !== generation) return;
+    detectLeaderChange();
+    render();
+  }
+
+  function currentLeader() {
+    let best = null;
+    for (const n of nodes.values()) {
+      if (n.up && n.status && n.status.role === "LEADER" && (!best || n.status.term > best.status.term)) best = n;
+    }
+    return best;
+  }
+
+  function detectLeaderChange() {
+    const leader = currentLeader();
+    const key = leader ? leader.id + "@" + leader.status.term : null;
+    if (!started) { started = true; addEvent("Watching " + nodes.size + " node" + (nodes.size === 1 ? "" : "s") + "."); }
+    if (key !== lastLeaderKey) {
+      if (leader) addEvent("Node " + leader.id + " became leader for term " + leader.status.term + ".");
+      else if (hadLeader) addEvent("There is no leader right now.");
+    }
+    if (leader) hadLeader = true;
+    lastLeaderKey = key;
+  }
+
+  // ---- rendering --------------------------------------------------------------------------------
+  const sorted = () => [...nodes.values()].sort((a, b) => (a.id ?? 1e9) - (b.id ?? 1e9));
+
+  function ago(ms) {
+    const s = Math.round(ms / 1000);
+    if (s < 5) return "just now";
+    if (s < 60) return s + " s ago";
+    const m = Math.round(s / 60);
+    return m < 60 ? m + " min ago" : Math.round(m / 60) + " h ago";
+  }
+
+  function esc(t) { return String(t).replace(/[&<>"]/g, c => ({ "&": "&amp;", "<": "&lt;", ">": "&gt;", '"': "&quot;" }[c])); }
+
+  let lostShown = false;
+
+  function lostCluster() {
+    return !demo && !everAnswered && polls >= GIVE_UP_AFTER;
+  }
+
+  function renderHeadline(list) {
+    const size = list.length;
+    const responding = list.filter(n => n.up).length;
+    // Nodes list their peers, so even when only some nodes are being watched the real cluster size is known.
+    const clusterSize = Math.max(size, ...list.filter(n => n.status).map(n => (n.status.peers || []).length + 1));
+    const partial = clusterSize > size;
+    const majority = Math.floor(clusterSize / 2) + 1;
+    const leader = currentLeader();
+    // Don't announce "0 nodes responding" while the first replies are still on their way.
+    const pending = !everAnswered && !lostCluster() && !demo;
+    // A watched follower may name a leader that isn't in the list.
+    const unwatched = leader ? null : list.find(n => n.up && n.status && n.status.leaderId != null && !nodes.has(n.status.leaderId));
+    const coverage = partial
+      ? "Watching " + size + " of " + clusterSize + " nodes."
+      : responding + " of " + size + " nodes responding.";
+    let head, sub;
+    if (lostCluster()) {
+      head = "Can't find a cluster.";
+      sub = explicit
+        ? "None of those addresses answered. Check that the nodes are running and that this browser can reach them."
+        : "This page reads node data from the server it was loaded from, and that server isn't a node. Enter the addresses of your nodes below.";
+    } else if (pending) {
+      head = "Connecting to the cluster";
+      sub = "Asking for node status.";
+    } else if (!partial && responding < majority) {
+      head = "Only " + responding + " of " + size + " nodes responding.";
+      sub = "The cluster needs " + majority + " nodes to elect a leader or commit a write.";
+    } else if (leader) {
+      head = "Node " + leader.id + " leads term " + leader.status.term + ".";
+      sub = coverage + " A write commits once " + majority + " nodes have it.";
+    } else if (unwatched) {
+      head = "Node " + unwatched.status.leaderId + " leads term " + unwatched.status.term + ".";
+      sub = coverage + " Node " + unwatched.status.leaderId + " isn't in your list, so it isn't shown. Add its address to watch it.";
+    } else {
+      head = "No leader right now.";
+      sub = "An election normally finishes within about 1.5 seconds. Writes fail until it does.";
+    }
+    $("headline").textContent = head;
+    $("subline").textContent = sub;
+    $("lost").hidden = !lostCluster() || demo;
+    $("legend").hidden = $("events-section").hidden = lostCluster();
+    $("console").hidden = demo || lostCluster() || pending;
+    if (lostCluster() && !lostShown) { lostShown = true; $("connect").open = true; prefillAddresses(); }
+    document.title = head.replace(/\.$/, "") + " - Raft cluster";
+  }
+
+  function tape(s, scale) {
+    const pct = v => (Math.max(0, v) / scale * 100).toFixed(2) + "%";
+    const snap = s.snapshotIndex, commit = Math.max(s.commitIndex, snap), last = Math.max(s.lastLogIndex, commit);
+    return `<div class="tape" role="img" aria-label="Entries 1 to ${snap} are in the snapshot, ${snap + 1} to ${commit} are committed, ${commit + 1} to ${last} are waiting for a majority">
+      <div class="seg snap" style="left:0;width:${pct(snap)}"></div>
+      <div class="seg commit" style="left:${pct(snap)};width:${pct(commit - snap)}"></div>
+      <div class="seg pending" style="left:${pct(commit)};width:${pct(last - commit)}"></div>
+    </div>`;
+  }
+
+  function tapeNote(s) {
+    const inLog = s.lastLogIndex - s.snapshotIndex;
+    if (s.lastLogIndex === 0) return "The log is empty.";
+    const parts = [];
+    if (s.snapshotIndex > 0) parts.push("Snapshot covers 1 to " + s.snapshotIndex);
+    parts.push(inLog + (inLog === 1 ? " entry" : " entries") + " kept in the log");
+    if (s.lastLogIndex > s.commitIndex) parts.push((s.lastLogIndex - s.commitIndex) + " not committed");
+    return parts.join(". ") + ".";
+  }
+
+  function renderNode(n, scale) {
+    const s = n.status;
+    const roleName = !n.up ? "Not responding" : s ? { LEADER: "Leader", FOLLOWER: "Follower", CANDIDATE: "Candidate" }[s.role] : "Checking";
+    const cls = ["node", n.up === false ? "down" : "", s && n.up ? s.role.toLowerCase() : ""].join(" ");
+    const where = shown(n.address);
+    const addr = demo ? esc(where) : `<a href="${esc(baseUrl(n.address))}/status.json">${esc(where)}</a>`;
+    let middle, stats;
+    if (s) {
+      const note = n.up ? tapeNote(s) : "Can't reach " + where + ". Last seen " + ago(Date.now() - n.lastSeen) + ".";
+      middle = `<div class="tape-wrap">${tape(s, scale)}</div><div class="tape-note">${esc(note)}</div>`;
+      stats = `<dl class="stats">
+        <div><dt>Term</dt><dd>${s.term}</dd></div>
+        <div><dt>Last entry</dt><dd>${s.lastLogIndex}</dd></div>
+        <div><dt>Committed</dt><dd>${s.commitIndex}</dd></div>
+        <div><dt>Snapshot</dt><dd>${s.snapshotIndex || "none"}</dd></div>
+        <div><dt>Keys</dt><dd>${s.keys}</dd></div></dl>`;
+    } else {
+      const note = n.up === false ? "Can't reach " + where + " yet." : "Waiting for the first reply.";
+      middle = `<div class="tape-note">${esc(note)}</div>`;
+      stats = "";
+    }
+    return `<article class="${cls}">
+      <div><div class="name">${esc(label(n))}</div>
+        <div class="role"><span class="mark"></span>${roleName}</div><div class="addr">${addr}</div></div>
+      <div>${middle}</div><div class="stats-wrap">${stats}</div></article>`;
+  }
+
+  function render() {
+    const list = sorted();
+    renderHeadline(list);
+    const scale = Math.max(10, ...list.map(n => n.status ? n.status.lastLogIndex : 0));
+    $("nodes").innerHTML = lostCluster() ? "" : list.map(n => renderNode(n, scale)).join("");
+    $("events").innerHTML = events.length
+      ? events.map(e => `<li><time datetime="${new Date(e.at).toISOString()}">${new Date(e.at).toLocaleTimeString()}</time><span>${esc(e.text)}</span></li>`).join("")
+      : `<li class="empty">Nothing yet. Leader changes, nodes dropping out and log compaction show up here.</li>`;
+  }
+
+  // ---- reading and writing data ------------------------------------------------------------------
+  const clientId = crypto.randomUUID ? crypto.randomUUID() : "web-" + Math.random().toString(36).slice(2);
+  let seq = 0;    // one write at a time, so the cluster can drop a retried write it already applied
+
+  // Writes go to the leader; if we don't know it, any reachable node will point us to it.
+  function leaderAddress() {
+    const leader = currentLeader();
+    if (leader) return leader.address;
+    for (const n of nodes.values()) {
+      if (!(n.up && n.status && n.status.leaderId != null)) continue;
+      const p = (n.status.peers || []).find(p => p.id === n.status.leaderId);
+      if (p) return p.address;
+    }
+    const any = [...nodes.values()].find(n => n.up);
+    return any ? any.address : null;
+  }
+
+  function blockedMessage(base) {
+    return new URL(base).origin !== location.origin
+      ? "The browser blocked the request to " + shown(base) + ". If this page isn't served by a node, start the nodes with --allowOrigin=" + location.origin
+      : "Couldn't reach " + shown(base) + ".";
+  }
+
+  async function kvCall(kind, key, value) {
+    let address = leaderAddress();
+    if (!address) throw new Error("No node is reachable right now.");
+    const mySeq = kind === "get" ? 0 : ++seq;
+    for (let hops = 0; hops < 4; hops++) {
+      const base = baseUrl(address);
+      let res;
+      try {
+        res = kind === "get"
+          ? await fetch(base + "/client/get?key=" + encodeURIComponent(key), { cache: "no-store" })
+          : await fetch(base + "/client/" + kind, {
+              method: "POST", headers: { "Content-Type": "application/json" },
+              body: JSON.stringify(kind === "set" ? { key, value, clientId, seq: mySeq } : { key, clientId, seq: mySeq })
+            });
+      } catch (e) {
+        throw new Error(blockedMessage(base));
+      }
+      const body = await res.json().catch(() => null);
+      if (!body) throw new Error("Unexpected reply from " + shown(base) + " (HTTP " + res.status + ").");
+      if (body.success) return body;
+      if (body.leaderHint && body.leaderHint !== address) { address = body.leaderHint; continue; }
+      throw new Error(body.error === "not leader"
+        ? "That node isn't the leader and doesn't know who is. An election may be running. Try again in a moment."
+        : body.error || "The request failed.");
+    }
+    throw new Error("The cluster kept redirecting the request. Try again in a moment.");
+  }
+
+  async function runKv(kind) {
+    const key = $("kv-key").value, value = $("kv-value").value;
+    const result = $("kv-result");
+    const show = (text, isError) => { result.textContent = text; result.classList.toggle("error", !!isError); };
+    if (!key) { show("Enter a key first.", true); $("kv-key").focus(); return; }
+    if (kind === "set" && !value) { show("Enter a value to set, or use Get to read the key.", true); $("kv-value").focus(); return; }
+    const buttons = ["kv-set", "kv-get", "kv-delete"].map($);
+    buttons.forEach(b => b.disabled = true);
+    show(kind === "get" ? "Reading..." : "Writing...", false);
+    try {
+      const reply = await kvCall(kind, key, value);
+      if (kind === "set") show('Saved "' + key + '" = "' + value + '".', false);
+      else if (kind === "delete") show('Deleted "' + key + '".', false);
+      else show(reply.value == null ? '"' + key + '" has no value.' : '"' + key + '" = "' + reply.value + '".', false);
+    } catch (e) {
+      show(e.message, true);
+    } finally {
+      buttons.forEach(b => b.disabled = false);
+    }
+  }
+  $("console-form").addEventListener("submit", ev => { ev.preventDefault(); runKv("set"); });
+  $("kv-get").addEventListener("click", () => runKv("get"));
+  $("kv-delete").addEventListener("click", () => runKv("delete"));
+
+  function saved() {
+    try { return localStorage.getItem(SAVED_KEY) || ""; } catch (e) { return ""; }
+  }
+  function remember(text) {
+    try { localStorage.setItem(SAVED_KEY, text); } catch (e) { /* private mode: just don't remember */ }
+  }
+  function prefillAddresses() {
+    const input = $("addresses");
+    if (input.value) return;
+    input.value = explicit ? explicit.join(", ") : saved();
+  }
+
+  // Accepts host:port, optionally with http:// or https:// in front.
+  const ADDRESS = /^(https?:\/\/)?(\[[0-9a-fA-F:]+\]|[A-Za-z0-9._-]+)(:\d{1,5})?$/;
+
+  function connect(list) {
+    explicit = list;
+    generation++;
+    events.length = 0;
+    lastLeaderKey = null; hadLeader = false; started = false; polls = 0; everAnswered = false; lostShown = false;
+    resetNodes();
+    remember(list.join(", "));
+    history.replaceState(null, "", "?nodes=" + encodeURI(list.join(",")));   // keeps "host:port,host:port" readable
+    $("connect").open = false;
+    render();
+    pollOnce();
+  }
+
+  $("connect-form").addEventListener("submit", ev => {
+    ev.preventDefault();
+    const list = parseAddresses($("addresses").value);
+    const bad = list.find(a => !ADDRESS.test(a));
+    const error = $("addresses-error");
+    if (!list.length) error.textContent = "Enter at least one address, like localhost:8001.";
+    else if (bad) error.textContent = "\"" + bad + "\" isn't a valid address. Use host:port, like localhost:8001.";
+    else error.textContent = "";
+    error.hidden = !error.textContent;
+    $("addresses").setAttribute("aria-invalid", String(!error.hidden));
+    if (error.hidden) connect(list);
+  });
+  if (demo) $("connect").hidden = true;
+
+  $("demo-banner").hidden = !demo;
+  $("pause").addEventListener("click", () => {
+    paused = !paused;
+    $("pause").textContent = paused ? "Resume updates" : "Pause updates";
+    $("pause").setAttribute("aria-pressed", String(paused));
+  });
+
+  (async function loop() {
+    if (!paused) await pollOnce();
+    setTimeout(loop, POLL_MS);
+  })();
+})();
+</script>
+</body>
+</html>
