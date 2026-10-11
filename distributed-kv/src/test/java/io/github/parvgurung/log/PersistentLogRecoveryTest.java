@@ -60,4 +60,22 @@ class PersistentLogRecoveryTest {
             assertEquals(1, log.lastIndex());
         }
     }
+
+    @Test
+    void aWriteCutInTheMiddleOfAMultiByteCharacterIsDroppedNotFatal() throws IOException {
+        byte[] good = (new LogEntry(1, 1, Command.set("a", "1")).serialize() + "\n").getBytes(StandardCharsets.UTF_8);
+        byte[] next = (new LogEntry(2, 1, Command.set("b", "\u65e5\u672c\u8a9e")).serialize() + "\n").getBytes(StandardCharsets.UTF_8);
+        // Keep everything up to and including the first byte of a three-byte character in the second entry.
+        int cut = 0;
+        while (next[cut] != (byte) 0xE6) cut++;
+        byte[] torn = new byte[good.length + cut + 1];
+        System.arraycopy(good, 0, torn, 0, good.length);
+        System.arraycopy(next, 0, torn, good.length, cut + 1);
+        Files.write(tempDir.resolve("raft.log"), torn);
+
+        try (PersistentLog log = new PersistentLog(tempDir.toString())) {
+            log.init(); // used to throw MalformedInputException and keep the node from starting
+            assertEquals(1, log.lastIndex());
+        }
+    }
 }

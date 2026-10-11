@@ -22,8 +22,8 @@ public record InstallSnapshotRequest(
     public static InstallSnapshotRequest fromJson(String json) {
         Map<String, Object> obj = Json.decode(json);
         return new InstallSnapshotRequest(
-            Json.getLong(obj, "term"),
-            Json.getLong(obj, "leaderId"),
+            Json.getNonNegativeLong(obj, "term"),
+            Json.getNodeId(obj, "leaderId"),
             Snapshot.fromMap(Json.getMap(obj, "snapshot"))
         );
     }

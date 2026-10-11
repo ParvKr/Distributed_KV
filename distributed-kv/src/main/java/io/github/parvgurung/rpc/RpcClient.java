@@ -9,7 +9,7 @@ import java.time.Duration;
 import java.util.Optional;
 import java.util.function.Function;
 
-public final class RpcClient {
+public class RpcClient {
     private static final Duration REQUEST_TIMEOUT = Duration.ofMillis(300);
     // A snapshot carries the whole state machine, so it gets far longer than a heartbeat does.
     private static final Duration SNAPSHOT_TIMEOUT = Duration.ofSeconds(10);

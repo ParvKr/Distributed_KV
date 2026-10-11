@@ -39,6 +39,7 @@ class RaftClusterTest {
     private final List<RaftNode> nodes = new ArrayList<>();
     private final Map<Integer, Integer> portById = new HashMap<>();
     private final Map<Integer, NodeConfig> configById = new HashMap<>();
+    private final Map<Integer, PartitionableRpcClient> clientById = new HashMap<>();
     private final HttpClient http = HttpClient.newHttpClient();
 
     @AfterEach
@@ -433,6 +434,88 @@ class RaftClusterTest {
         assertTrue(post(newLeader, "/client/set", "key", "after", "value", "failover").success());
     }
 
+    // ---------------------------------------------------------------- partitions: PreVote and CheckQuorum
+
+    private void isolate(RaftNode victim) {
+        for (RaftNode other : nodes) {
+            if (other == victim) continue;
+            clientById.get(victim.nodeId()).block("http://localhost:" + portById.get(other.nodeId()));
+            clientById.get(other.nodeId()).block("http://localhost:" + portById.get(victim.nodeId()));
+        }
+    }
+
+    private void healPartition() {
+        clientById.values().forEach(PartitionableRpcClient::unblockAll);
+    }
+
+    @Test
+    void anIsolatedFollowerCannotInflateTheTermOrDeposeTheLeader() throws Exception {
+        startCluster(3);
+        RaftNode leader = awaitLeader();
+        RaftNode loner = nodes.stream().filter(n -> n != leader).findFirst().orElseThrow();
+        long term = termOf(leader);
+
+        isolate(loner);
+        Thread.sleep(5000); // several election timeouts: without PreVote the loner would bump its term each time
+
+        assertEquals(term, termOf(loner), "an isolated node's term must not run away");
+        assertEquals(term, termOf(leader));
+
+        healPartition();
+        assertTrue(post(leader, "/client/set", "key", "k", "value", "v").success());
+        awaitCondition("the loner to catch up", () -> loner.commitIndex() >= leader.commitIndex());
+        assertEquals(NodeRole.LEADER, leader.role(), "rejoining must not depose the leader");
+        assertEquals(term, termOf(leader), "rejoining must not cause a new election");
+        assertEquals(1, nodes.stream().filter(n -> n.role() == NodeRole.LEADER).count());
+    }
+
+    @Test
+    void aLeaderCutOffFromTheMajorityStepsDownAndTheClusterMovesOn() throws Exception {
+        startCluster(3);
+        RaftNode oldLeader = awaitLeader();
+        assertTrue(post(oldLeader, "/client/set", "key", "before", "value", "1").success());
+
+        isolate(oldLeader);
+
+        awaitCondition("the cut-off leader to step down", () -> oldLeader.role() != NodeRole.LEADER);
+        RaftNode newLeader = awaitLeaderOtherThan(oldLeader);
+
+        // Clients get an immediate redirect from the old leader, not a 2 s write timeout.
+        long start = System.nanoTime();
+        ClientResponse refused = post(oldLeader, "/client/set", "key", "x", "value", "y");
+        assertFalse(refused.success());
+        assertEquals("not leader", refused.error());
+        assertTrue((System.nanoTime() - start) / 1_000_000 < 500, "the old leader should refuse right away");
+
+        assertTrue(post(newLeader, "/client/set", "key", "after", "value", "2").success());
+
+        healPartition();
+        awaitCondition("the old leader to rejoin as a follower",
+            () -> oldLeader.role() == NodeRole.FOLLOWER && oldLeader.commitIndex() >= newLeader.commitIndex());
+        assertEquals(1, nodes.stream().filter(n -> n.role() == NodeRole.LEADER).count());
+        assertEquals("1", awaitGet(newLeader, "before"));
+        assertEquals("2", awaitGet(newLeader, "after"));
+        assertEquals(termOf(newLeader), termOf(oldLeader));
+    }
+
+    @Test
+    void aCutOffLeaderDoesNotRunUpTheTermWhileIsolated() throws Exception {
+        startCluster(3);
+        RaftNode leader = awaitLeader();
+        long term = termOf(leader);
+
+        isolate(leader);
+        awaitCondition("the leader to step down", () -> leader.role() != NodeRole.LEADER);
+        Thread.sleep(4000);
+
+        // The other two elected someone (term + 1); the isolated ex-leader must not have gone past that.
+        long highest = nodes.stream().filter(n -> n != leader).mapToLong(n -> {
+            try { return termOf(n); } catch (Exception e) { throw new RuntimeException(e); }
+        }).max().orElseThrow();
+        assertEquals(term + 1, highest);
+        assertEquals(term, termOf(leader), "the isolated ex-leader must wait quietly, not keep starting elections");
+    }
+
     // ---------------------------------------------------------------- helpers
 
     private void seed(int nodeId, long term, LogEntry... entries) throws IOException {
@@ -460,7 +543,9 @@ class RaftClusterTest {
             }
             NodeConfig config = new NodeConfig(id, portById.get(id), tempDir.resolve("node" + id), peers, snapshotThreshold);
             configById.put(id, config);
-            RaftNode node = new RaftNode(config);
+            PartitionableRpcClient client = new PartitionableRpcClient();
+            clientById.put(id, client);
+            RaftNode node = new RaftNode(config, client);
             node.start();
             nodes.add(node);
         }

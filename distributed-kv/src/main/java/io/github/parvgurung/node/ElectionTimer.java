@@ -19,7 +19,8 @@ public final class ElectionTimer {
     });
 
     private volatile ScheduledFuture<?> pendingFire;
-    private long deadlineNanos = Long.MAX_VALUE;
+    private long deadlineNanos;
+    private boolean armed = false;   // nanoTime() may be negative, so no sentinel value can mean "never"
 
     public ElectionTimer(Runnable onTimeout, int minMs, int maxMs) {
         if (minMs >= maxMs)
@@ -48,7 +49,7 @@ public final class ElectionTimer {
      * its own lock before acting on a timeout.
      */
     public synchronized boolean hasElapsed() {
-        return System.nanoTime() - deadlineNanos >= 0;
+        return armed && System.nanoTime() - deadlineNanos >= 0;
     }
 
     public void shutdown() {
@@ -56,7 +57,7 @@ public final class ElectionTimer {
     }
 
     private void cancelPending() {
-        deadlineNanos = Long.MAX_VALUE;
+        armed = false;
         if (pendingFire != null)
             pendingFire.cancel(false);
     }
@@ -76,6 +77,7 @@ public final class ElectionTimer {
             return;
         int delay = minMs + random.nextInt(maxMs - minMs + 1);
         deadlineNanos = System.nanoTime() + TimeUnit.MILLISECONDS.toNanos(delay);
+        armed = true;
         pendingFire = scheduler.schedule(this::fire, delay, TimeUnit.MILLISECONDS);
     }
 }

@@ -13,6 +13,11 @@ import io.github.parvgurung.util.Json;
 
 import java.io.IOException;
 import java.io.UncheckedIOException;
+import java.nio.channels.FileChannel;
+import java.nio.channels.FileLock;
+import java.nio.channels.OverlappingFileLockException;
+import java.nio.file.Files;
+import java.nio.file.StandardOpenOption;
 import java.util.ArrayList;
 import java.util.LinkedHashMap;
 import java.util.List;
@@ -29,6 +34,13 @@ public final class RaftNode implements RaftRpcHandler{
     private static final int HEARTBEAT_INTERVAL_MS = 100;
     private static final long CLIENT_WRITE_TIMEOUT_MS = 2000;
     private static final long LEADERSHIP_CONFIRM_TIMEOUT_MS = 1000;
+    private static final int MAX_ENTRIES_PER_APPEND = 256;
+    private static final long MAX_BYTES_PER_APPEND = 4L * 1024 * 1024;
+    // A follower that heard from a leader this recently refuses to help anyone start an election. Heartbeats
+    // arrive every 100 ms, so a follower that can still reach its leader is always inside this window.
+    private static final long LEADER_STICKINESS_MS = ELECTION_TIMEOUT_MIN_MS / 2;
+    // A leader that has not heard from a majority for this long steps down (it is probably cut off).
+    private static final long CHECK_QUORUM_WINDOW_MS = ELECTION_TIMEOUT_MAX_MS;
 
     private final NodeConfig config;
     private final RaftPersistentState persistentState;
@@ -41,6 +53,8 @@ public final class RaftNode implements RaftRpcHandler{
     private final ExecutorService rpcExecutor;
     private final ScheduledExecutorService heartbeatScheduler;
     private final ExecutorService snapshotExecutor;
+    // Sending a snapshot can take seconds; it must not occupy the pool that carries heartbeats and votes.
+    private final ExecutorService snapshotSendExecutor;
     private final AtomicBoolean snapshotInFlight = new AtomicBoolean(false);
     // Followers a snapshot is currently being sent to; heartbeats must not queue duplicates of a big transfer.
     private final Set<Integer> snapshotSendsInFlight = ConcurrentHashMap.newKeySet();
@@ -62,18 +76,29 @@ public final class RaftNode implements RaftRpcHandler{
 
     private final Map<Long, CompletableFuture<Boolean>> pendingClientWrites = new ConcurrentHashMap<>();
 
+    // When this node last accepted an AppendEntries/InstallSnapshot from a current leader (0 = never).
+    private long lastLeaderContactNanos = 0;
+    // For a leader: when each follower last answered in the leader's term.
+    private final Map<Integer, Long> lastAckNanos = new ConcurrentHashMap<>();
+
     public RaftNode(NodeConfig config) {
+        this(config, new RpcClient());
+    }
+
+    // Tests pass an RpcClient that can drop traffic, to simulate network partitions.
+    RaftNode(NodeConfig config, RpcClient rpcClient) {
         this.config = config;
         this.persistentState = new RaftPersistentState(config.dataDir.toString());
         this.log = new PersistentLog(config.dataDir.toString());
         this.stateMachine = new KVStateMachine();
         this.snapshotStore = new SnapshotStore(config.dataDir.toString());
-        this.rpcClient = new RpcClient();
+        this.rpcClient = rpcClient;
 
         this.electionTimer = new ElectionTimer(this::onElectionTimeout, ELECTION_TIMEOUT_MIN_MS, ELECTION_TIMEOUT_MAX_MS);
         this.rpcExecutor = Executors.newFixedThreadPool(16);
         this.heartbeatScheduler = Executors.newSingleThreadScheduledExecutor(daemonFactory("raft-heartbeat"));
         this.snapshotExecutor = Executors.newSingleThreadExecutor(daemonFactory("raft-snapshot"));
+        this.snapshotSendExecutor = Executors.newCachedThreadPool(daemonFactory("raft-snapshot-send"));
     }
 
     private static ThreadFactory daemonFactory(String prefix) {
@@ -89,6 +114,48 @@ public final class RaftNode implements RaftRpcHandler{
     // Lifecycle
     // =================================================================
     public synchronized void start() throws IOException {
+        acquireDataDirectoryLock();
+        try {
+            startUnlocked();
+        } catch (IOException | RuntimeException e) {
+            releaseDataDirectoryLock(); // a failed start must not leave the directory locked
+            throw e;
+        }
+    }
+
+    // Two nodes sharing one data directory would interleave writes into the same log and corrupt it.
+    private FileChannel lockChannel;
+    private FileLock directoryLock;
+
+    private void acquireDataDirectoryLock() throws IOException {
+        Files.createDirectories(config.dataDir);
+        FileChannel channel = FileChannel.open(config.dataDir.resolve("node.lock"),
+            StandardOpenOption.CREATE, StandardOpenOption.WRITE);
+        FileLock lock;
+        try {
+            lock = channel.tryLock();
+        } catch (OverlappingFileLockException sameJvm) {
+            lock = null;
+        }
+        if (lock == null) {
+            channel.close();
+            throw new IOException("Data directory " + config.dataDir + " is already in use by another node");
+        }
+        lockChannel = channel;
+        directoryLock = lock;
+    }
+
+    private void releaseDataDirectoryLock() {
+        try {
+            if (directoryLock != null) directoryLock.release();
+            if (lockChannel != null) lockChannel.close();
+        } catch (IOException ignored) {
+        }
+        directoryLock = null;
+        lockChannel = null;
+    }
+
+    private void startUnlocked() throws IOException {
         persistentState.init();
         Optional<Snapshot> snapshot = snapshotStore.load();
         if (snapshot.isPresent()) {
@@ -111,8 +178,10 @@ public final class RaftNode implements RaftRpcHandler{
         rpcExecutor.shutdownNow();
         heartbeatScheduler.shutdownNow();
         snapshotExecutor.shutdownNow();
+        snapshotSendExecutor.shutdownNow();
         if (rpcServer != null) rpcServer.stop();
         log.close();
+        releaseDataDirectoryLock();
     }
 
     // =================================================================
@@ -127,8 +196,18 @@ public final class RaftNode implements RaftRpcHandler{
         startElection();
     }
 
+    private boolean heardLeaderRecently() {
+        return lastLeaderContactNanos != 0
+            && System.nanoTime() - lastLeaderContactNanos < TimeUnit.MILLISECONDS.toNanos(LEADER_STICKINESS_MS);
+    }
+
+    /**
+     * Phase one of an election (PreVote): ask the others whether they would vote for us at the next term,
+     * without changing anything on either side. Only if a majority says yes do we really bump the term.
+     * A node that is cut off, or merely slow, therefore cannot inflate the term and depose a healthy leader.
+     */
     private void startElection() {
-        final long electionTerm;
+        final long termAtStart;
         final long lastLogIndex;
         final long lastLogTerm;
         final int myId = config.nodeId;
@@ -137,24 +216,62 @@ public final class RaftNode implements RaftRpcHandler{
             // The timeout may be stale: a vote or heartbeat can have reset the timer while this task
             // waited for the lock. Starting an election then would needlessly depose a healthy leader.
             if (!electionTimer.hasElapsed()) return;
-            role = NodeRole.CANDIDATE;
-            persistentState.setTermAndVote(persistentState.getCurrentTerm() + 1, myId);
-            currentLeaderId = null;
-
-            electionTerm = persistentState.getCurrentTerm();
+            termAtStart = persistentState.getCurrentTerm();
+            if (config.peers.isEmpty()) {
+                beginElection(termAtStart); // nobody to ask
+                return;
+            }
             lastLogIndex = log.lastIndex();
             lastLogTerm = log.lastTerm();
         }
-        electionTimer.reset();
+        electionTimer.reset(); // if the pre-vote fails we simply try again after another timeout
 
-        if (config.peers.isEmpty()) {
-            synchronized (this) {
-                if (role == NodeRole.CANDIDATE && persistentState.getCurrentTerm() == electionTerm)
-                    becomeLeader();
-            }
+        RequestVoteRequest preVote = new RequestVoteRequest(termAtStart + 1, myId, lastLogIndex, lastLogTerm, true);
+        AtomicInteger grants = new AtomicInteger(1);
+        AtomicBoolean started = new AtomicBoolean(false);
+        for (NodeConfig.PeerAddress peer : config.peers.values()) {
+            rpcExecutor.submit(() -> askPreVote(peer, preVote, termAtStart, grants, started));
+        }
+    }
+
+    private void askPreVote(NodeConfig.PeerAddress peer, RequestVoteRequest request, long termAtStart,
+                            AtomicInteger grants, AtomicBoolean started) {
+        Optional<RequestVoteResponse> responseOpt = rpcClient.sendRequestVote(peer.baseUrl(), request);
+        if (responseOpt.isEmpty()) {
             return;
         }
-        RequestVoteRequest request = new RequestVoteRequest(electionTerm, myId, lastLogIndex, lastLogTerm);
+        RequestVoteResponse response = responseOpt.get();
+        synchronized (this) {
+            if (response.term() > persistentState.getCurrentTerm()) {
+                becomeFollower(response.term());
+                currentLeaderId = null;
+                return;
+            }
+            if (response.voteGranted() && grants.incrementAndGet() >= config.majority()
+                    && started.compareAndSet(false, true)) {
+                beginElection(termAtStart);
+            }
+        }
+    }
+
+    /** Phase two: a real election. Callers hold the lock. */
+    private void beginElection(long termAtStart) {
+        // Things may have changed while the pre-vote was in flight: a leader may have appeared.
+        if (role == NodeRole.LEADER || persistentState.getCurrentTerm() != termAtStart || heardLeaderRecently()) {
+            return;
+        }
+        final int myId = config.nodeId;
+        role = NodeRole.CANDIDATE;
+        persistentState.setTermAndVote(termAtStart + 1, myId);
+        currentLeaderId = null;
+        electionTimer.reset();
+
+        final long electionTerm = persistentState.getCurrentTerm();
+        if (config.peers.isEmpty()) {
+            becomeLeader();
+            return;
+        }
+        RequestVoteRequest request = new RequestVoteRequest(electionTerm, myId, log.lastIndex(), log.lastTerm());
         AtomicInteger votesGranted = new AtomicInteger(1);
         for (NodeConfig.PeerAddress peer : config.peers.values()) {
             rpcExecutor.submit(() -> requestVoteFromPeer(peer, request, electionTerm, votesGranted));
@@ -206,9 +323,12 @@ public final class RaftNode implements RaftRpcHandler{
 
         nextIndex.clear();
         matchIndex.clear();
+        lastAckNanos.clear();
+        long now = System.nanoTime();
         for (Integer peerId : config.peers.keySet()) {
             nextIndex.put(peerId, noopIndex);
             matchIndex.put(peerId, 0L);
+            lastAckNanos.put(peerId, now);   // a new leader gets a full window before it is judged
         }
         tryAdvanceCommitIndex(); // a single-node cluster commits on its own
         cancelHeartbeat();
@@ -239,10 +359,31 @@ public final class RaftNode implements RaftRpcHandler{
         pendingClientWrites.clear();
     }
 
+    /**
+     * CheckQuorum: a leader that has not heard from a majority recently is probably cut off from the
+     * cluster. Staying leader would only make clients wait for writes that cannot commit, so step down
+     * (same term) and let clients be redirected. Callers hold the lock.
+     */
+    private boolean hasQuorumContact() {
+        if (config.peers.isEmpty()) return true;
+        long now = System.nanoTime();
+        long window = TimeUnit.MILLISECONDS.toNanos(CHECK_QUORUM_WINDOW_MS);
+        int inTouch = 1; // ourselves
+        for (long ack : lastAckNanos.values()) {
+            if (now - ack <= window) inTouch++;
+        }
+        return inTouch >= config.majority();
+    }
+
     private void replicateToAllPeers() {
         boolean isLeader;
         synchronized (this) {
             isLeader = role == NodeRole.LEADER;
+            if (isLeader && !hasQuorumContact()) {
+                becomeFollower(persistentState.getCurrentTerm());
+                currentLeaderId = null;
+                isLeader = false;
+            }
         }
         if(!isLeader) return;
         for (Map.Entry<Integer, NodeConfig.PeerAddress> entry : config.peers.entrySet()) {
@@ -267,7 +408,7 @@ public final class RaftNode implements RaftRpcHandler{
             if (ni <= log.snapshotIndex()) {
                 // The entries this follower needs were compacted away; only a snapshot can catch it up.
                 if (snapshotSendsInFlight.add(peerId)) {
-                    rpcExecutor.submit(() -> {
+                    snapshotSendExecutor.submit(() -> {
                         try {
                             sendSnapshotToPeer(peerId, peerAddress, term);
                         } finally {
@@ -280,9 +421,17 @@ public final class RaftNode implements RaftRpcHandler{
             prevLogIndex = ni - 1;
             prevLogTerm = log.termAt(prevLogIndex).orElse(0L);
             myLastIndexAtSend = log.lastIndex();
+            // A far-behind follower gets its backlog in bounded chunks: one huge request would take longer
+            // than the RPC timeout and keep the follower busy while it should be answering heartbeats.
             List<LogEntry> toSend = new ArrayList<>();
-            for (long i = ni; i <= myLastIndexAtSend; i++) {
-                log.get(i).ifPresent(toSend::add);
+            long bytes = 0;
+            for (long i = ni; i <= myLastIndexAtSend && toSend.size() < MAX_ENTRIES_PER_APPEND; i++) {
+                Optional<LogEntry> entry = log.get(i);
+                if (entry.isEmpty()) continue;
+                long size = approximateSize(entry.get());
+                if (!toSend.isEmpty() && bytes + size > MAX_BYTES_PER_APPEND) break;
+                toSend.add(entry.get());
+                bytes += size;
             }
             entries = toSend;
             leaderCommitSnapshot = commitIndex;
@@ -301,12 +450,16 @@ public final class RaftNode implements RaftRpcHandler{
             if (role != NodeRole.LEADER || persistentState.getCurrentTerm() != term) {
                 return;
             }
+            lastAckNanos.put(peerId, System.nanoTime()); // any same-term reply shows the follower is reachable
             if (response.success()) {
                 // Replies can arrive out of order; never let a stale one move matchIndex backwards.
                 long newMatch = Math.max(matchIndex.getOrDefault(peerId, 0L), prevLogIndex + entries.size());
                 matchIndex.put(peerId, newMatch);
                 nextIndex.put(peerId, newMatch + 1);
                 tryAdvanceCommitIndex();
+                if (newMatch < log.lastIndex() && !entries.isEmpty()) {
+                    rpcExecutor.submit(() -> replicateToPeer(peerId, peerAddress)); // more backlog to send
+                }
             } else if (response.conflictIndex() > 0) {
                 // A real log mismatch. Always step back at least one entry so the retry makes progress.
                 long newNext = Math.max(1, Math.min(resolveConflict(response, myLastIndexAtSend), prevLogIndex));
@@ -316,6 +469,11 @@ public final class RaftNode implements RaftRpcHandler{
             // else: the follower failed for a reason unrelated to the log (e.g. disk error). Retry on the
             // next heartbeat rather than hammering it.
         }
+    }
+
+    private static long approximateSize(LogEntry entry) {
+        Command c = entry.command();
+        return 64L + c.key().length() + (c.value() == null ? 0 : c.value().length());
     }
 
     private void sendSnapshotToPeer(int peerId, NodeConfig.PeerAddress peerAddress, long term) {
@@ -344,6 +502,7 @@ public final class RaftNode implements RaftRpcHandler{
             if (role != NodeRole.LEADER || persistentState.getCurrentTerm() != term) {
                 return;
             }
+            lastAckNanos.put(peerId, System.nanoTime());
             long newMatch = Math.max(matchIndex.getOrDefault(peerId, 0L), snapshot.lastIncludedIndex());
             matchIndex.put(peerId, newMatch);
             nextIndex.put(peerId, Math.max(nextIndex.getOrDefault(peerId, 0L), newMatch + 1));
@@ -458,6 +617,7 @@ public final class RaftNode implements RaftRpcHandler{
             becomeFollower(request.term());
         }
         currentLeaderId = request.leaderId();
+        lastLeaderContactNanos = System.nanoTime();
         electionTimer.reset();
 
         Snapshot snapshot = request.snapshot();
@@ -483,6 +643,9 @@ public final class RaftNode implements RaftRpcHandler{
 
     @Override
     public synchronized RequestVoteResponse handleRequestVote(RequestVoteRequest request) {
+        if (request.preVote()) {
+            return handlePreVote(request);
+        }
         long currentTerm = persistentState.getCurrentTerm();
         if (request.term() < currentTerm) {
             return new RequestVoteResponse(currentTerm, false);
@@ -493,13 +656,27 @@ public final class RaftNode implements RaftRpcHandler{
         }
         currentTerm = persistentState.getCurrentTerm();
         Integer votedFor = persistentState.votedFor();
-        int candidateId = Math.toIntExact(request.candidateId());
+        int candidateId = (int) request.candidateId(); // validated to fit an int when the request is parsed
         boolean logIsUpToDate = log.isCandidateLogUpToDate(request.lastLogIndex(), request.lastLogTerm());
         boolean grant = (votedFor == null || votedFor.intValue() == candidateId) && logIsUpToDate;
         if (grant) {
             persistentState.setVotedFor(candidateId);
             electionTimer.reset();
         }
+        return new RequestVoteResponse(currentTerm, grant);
+    }
+
+    /**
+     * "Would you vote for me at this term?" Answering changes nothing here: no term bump, no recorded vote,
+     * no timer reset. We say yes only if the candidate could win a real vote from us, and we have not
+     * heard from a leader recently (otherwise there is no reason to hold an election).
+     */
+    private RequestVoteResponse handlePreVote(RequestVoteRequest request) {
+        long currentTerm = persistentState.getCurrentTerm();
+        boolean grant = role != NodeRole.LEADER
+            && request.term() > currentTerm
+            && !heardLeaderRecently()
+            && log.isCandidateLogUpToDate(request.lastLogIndex(), request.lastLogTerm());
         return new RequestVoteResponse(currentTerm, grant);
     }
 
@@ -513,6 +690,7 @@ public final class RaftNode implements RaftRpcHandler{
             becomeFollower(request.term());
         }
         currentLeaderId = request.leaderId();
+        lastLeaderContactNanos = System.nanoTime();
         electionTimer.reset();
 
         long prevLogIndex = request.prevLogIndex();
@@ -543,18 +721,20 @@ public final class RaftNode implements RaftRpcHandler{
 
         try {
             long index = prevLogIndex;
+            List<LogEntry> toAppend = new ArrayList<>();
             for (LogEntry newEntry : newEntries) {
                 index++;
-                Optional<LogEntry> existing = log.get(index);
-                if (existing.isPresent()) {
-                    if (existing.get().term() != newEntry.term()) {
+                if (toAppend.isEmpty()) {
+                    // Skip entries we already have; at the first one that differs, drop our suffix from there.
+                    Optional<LogEntry> existing = log.get(index);
+                    if (existing.isPresent()) {
+                        if (existing.get().term() == newEntry.term()) continue;
                         log.truncateFrom(index);
-                        log.append(new LogEntry(index, newEntry.term(), newEntry.command()));
                     }
-                } else {
-                    log.append(new LogEntry(index, newEntry.term(), newEntry.command()));
                 }
+                toAppend.add(new LogEntry(index, newEntry.term(), newEntry.command()));
             }
+            log.appendAll(toAppend); // one fsync for the whole batch
         } catch (IOException e) {
             return new AppendEntriesResponse(persistentState.getCurrentTerm(), false, 0, 0);
         }
@@ -618,6 +798,8 @@ public final class RaftNode implements RaftRpcHandler{
                         if (response.term() > persistentState.getCurrentTerm()) {
                             becomeFollower(response.term());
                             currentLeaderId = null;
+                        } else if (role == NodeRole.LEADER && persistentState.getCurrentTerm() == term && response.term() == term) {
+                            lastAckNanos.put(peer.nodeId(), System.nanoTime());
                         }
                     }
                     if (response.term() > term) {
@@ -725,6 +907,20 @@ public final class RaftNode implements RaftRpcHandler{
         }
         obj.put("peers", peerList);
         return Json.encode(obj);
+    }
+
+    // Package-private views for tests that check cluster-wide invariants.
+    synchronized long currentTerm() {
+        return persistentState.getCurrentTerm();
+    }
+
+    /** The current term if this node is the leader, otherwise 0. Role and term are read together. */
+    synchronized long termIfLeader() {
+        return role == NodeRole.LEADER ? persistentState.getCurrentTerm() : 0;
+    }
+
+    synchronized KVStateMachine.State stateSnapshot() {
+        return stateMachine.capture();
     }
 
     public synchronized NodeRole role() {

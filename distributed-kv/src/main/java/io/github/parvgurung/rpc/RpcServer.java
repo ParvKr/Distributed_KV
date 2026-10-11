@@ -64,7 +64,8 @@ public class RpcServer {
 
     private void handleRequestVote(HttpExchange exchange) throws IOException {
         withErrorHandling(exchange, () -> {
-            String body = readBody(exchange);
+            if (rejectUnlessJsonPost(exchange)) return;
+            String body = readBody(exchange, MAX_RAFT_BODY_BYTES);
             RequestVoteRequest req = RequestVoteRequest.fromJson(body);
             RequestVoteResponse resp = handler.handleRequestVote(req);
             writeJson(exchange, 200, resp.toJson());
@@ -73,7 +74,8 @@ public class RpcServer {
 
     private void handleAppendEntries(HttpExchange exchange) throws IOException {
         withErrorHandling(exchange, () -> {
-            String body = readBody(exchange);
+            if (rejectUnlessJsonPost(exchange)) return;
+            String body = readBody(exchange, MAX_RAFT_BODY_BYTES);
             AppendEntriesRequest req = AppendEntriesRequest.fromJson(body);
             AppendEntriesResponse resp = handler.handleAppendEntries(req);
             writeJson(exchange, 200, resp.toJson());
@@ -82,7 +84,8 @@ public class RpcServer {
 
     private void handleInstallSnapshot(HttpExchange exchange) throws IOException {
         withErrorHandling(exchange, () -> {
-            String body = readBody(exchange);
+            if (rejectUnlessJsonPost(exchange)) return;
+            String body = readBody(exchange, MAX_SNAPSHOT_BODY_BYTES);
             InstallSnapshotRequest req = InstallSnapshotRequest.fromJson(body);
             InstallSnapshotResponse resp = handler.handleInstallSnapshot(req);
             writeJson(exchange, 200, resp.toJson());
@@ -158,7 +161,7 @@ public class RpcServer {
     private void handleClientSet(HttpExchange exchange) throws IOException {
         withErrorHandling(exchange, () -> {
             if (rejectUnlessJsonPost(exchange)) return;
-            String body = readBody(exchange);
+            String body = readBody(exchange, MAX_CLIENT_BODY_BYTES);
             Map<String, Object> obj = Json.decode(body);
             String key = Json.getString(obj, "key");
             String value = Json.getString(obj, "value");
@@ -170,7 +173,7 @@ public class RpcServer {
     private void handleClientDelete(HttpExchange exchange) throws IOException {
         withErrorHandling(exchange, () -> {
             if (rejectUnlessJsonPost(exchange)) return;
-            String body = readBody(exchange);
+            String body = readBody(exchange, MAX_CLIENT_BODY_BYTES);
             Map<String, Object> obj = Json.decode(body);
             String key = Json.getString(obj, "key");
             ClientResponse resp = handler.handleClientDelete(key, Json.getString(obj, "clientId"), optionalSeq(obj));
@@ -237,6 +240,8 @@ public class RpcServer {
     private void withErrorHandling(HttpExchange exchange, ThrowingRunnable action) throws IOException {
         try {
             action.run();
+        } catch(PayloadTooLargeException e) {
+            writeError(exchange, 413, e);
         } catch(IllegalArgumentException e) {
             // malformed JSON, missing or invalid fields: the caller's fault
             writeError(exchange, 400, e);
@@ -252,8 +257,29 @@ public class RpcServer {
         writeJson(exchange, status, ClientResponse.error(message).toJson());
     }
 
-    private String readBody(HttpExchange exchange) throws IOException {
-        return new String(exchange.getRequestBody().readAllBytes(), StandardCharsets.UTF_8);
+    // Generous limits: they exist so one request cannot make a node read gigabytes, not to police normal use.
+    private static final int MAX_CLIENT_BODY_BYTES = 16 * 1024 * 1024;
+    private static final int MAX_RAFT_BODY_BYTES = 128 * 1024 * 1024;
+    private static final int MAX_SNAPSHOT_BODY_BYTES = 512 * 1024 * 1024;
+
+    private static final class PayloadTooLargeException extends RuntimeException {
+        PayloadTooLargeException(int limit) {
+            super("Request body is larger than the " + (limit / (1024 * 1024)) + " MiB limit");
+        }
+    }
+
+    private String readBody(HttpExchange exchange, int limit) throws IOException {
+        String declared = exchange.getRequestHeaders().getFirst("Content-Length");
+        if (declared != null) {
+            try {
+                if (Long.parseLong(declared.trim()) > limit) throw new PayloadTooLargeException(limit);
+            } catch (NumberFormatException ignored) {
+                // a bogus header is the HTTP layer's problem; the byte limit below still applies
+            }
+        }
+        byte[] bytes = exchange.getRequestBody().readNBytes(limit + 1);
+        if (bytes.length > limit) throw new PayloadTooLargeException(limit);
+        return new String(bytes, StandardCharsets.UTF_8);
     }
 
     private void writeJson(HttpExchange exchange, int status, String json) throws IOException {
@@ -265,13 +291,46 @@ public class RpcServer {
         }
     }
 
+    /** Percent-decoding that rejects invalid UTF-8 instead of quietly substituting U+FFFD (which would merge distinct keys). */
+    private static String decodeStrictly(String raw) {
+        java.io.ByteArrayOutputStream bytes = new java.io.ByteArrayOutputStream();
+        for (int i = 0; i < raw.length(); ) {
+            int cp = raw.codePointAt(i);
+            if (cp == '%') {
+                if (i + 2 >= raw.length())
+                    throw new IllegalArgumentException("Truncated percent-escape in query string");
+                try {
+                    bytes.write(Integer.parseInt(raw.substring(i + 1, i + 3), 16));
+                } catch (NumberFormatException e) {
+                    throw new IllegalArgumentException("Invalid percent-escape in query string");
+                }
+                i += 3;
+            } else if (cp == '+') {
+                bytes.write(' ');
+                i++;
+            } else {
+                byte[] utf8 = new String(Character.toChars(cp)).getBytes(StandardCharsets.UTF_8);
+                bytes.write(utf8, 0, utf8.length);
+                i += Character.charCount(cp);
+            }
+        }
+        try {
+            return StandardCharsets.UTF_8.newDecoder()
+                .onMalformedInput(java.nio.charset.CodingErrorAction.REPORT)
+                .onUnmappableCharacter(java.nio.charset.CodingErrorAction.REPORT)
+                .decode(java.nio.ByteBuffer.wrap(bytes.toByteArray())).toString();
+        } catch (java.nio.charset.CharacterCodingException e) {
+            throw new IllegalArgumentException("Query string is not valid UTF-8");
+        }
+    }
+
     private String queryParam(URI uri, String name) {
         String query = uri.getRawQuery();
         if (query == null) return null;
         for (String pair : query.split("&")) {
             var kv = pair.split("=", 2);
             if (kv.length == 2 && kv[0].equals(name)) {
-                return java.net.URLDecoder.decode(kv[1], StandardCharsets.UTF_8);
+                return decodeStrictly(kv[1]);
             }
         }
         return null;

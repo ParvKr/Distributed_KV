@@ -56,12 +56,12 @@ public record AppendEntriesRequest(
             entries.add(new LogEntry(index, term, command));
         }
         return new AppendEntriesRequest(
-            Json.getLong(obj, "term"),
-            Json.getLong(obj, "leaderId"),
-            Json.getLong(obj, "prevLogIndex"),
-            Json.getLong(obj, "prevLogTerm"),
+            Json.getNonNegativeLong(obj, "term"),
+            Json.getNodeId(obj, "leaderId"),
+            Json.getNonNegativeLong(obj, "prevLogIndex"),
+            Json.getNonNegativeLong(obj, "prevLogTerm"),
             entries,
-            Json.getLong(obj, "leaderCommit")
+            Json.getNonNegativeLong(obj, "leaderCommit")
         );
     }
 }

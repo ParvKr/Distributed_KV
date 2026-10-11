@@ -15,6 +15,9 @@ public record Command(CommandType type, String key, String value, String clientI
         if (type == null) {
             throw new IllegalArgumentException("Command type cannot be null");
         }
+        requireWellFormed("Key", key);
+        requireWellFormed("Value", value);
+        requireWellFormed("Client ID", clientId);
         if (clientId == null ? seq != 0 : (clientId.isEmpty() || seq < 1)) {
             throw new IllegalArgumentException("A client ID needs a sequence number >= 1, and neither is allowed without the other");
         }
@@ -29,6 +32,20 @@ public record Command(CommandType type, String key, String value, String clientI
             }
             if (type == CommandType.SET && value == null) {
                 throw new IllegalArgumentException("Value cannot be null for SET");
+            }
+        }
+    }
+
+    // Keys and values are stored as UTF-8. An unpaired surrogate cannot be encoded: it would be written as
+    // '?', so after a restart the data would differ from what was acknowledged (and distinct keys could collide).
+    private static void requireWellFormed(String what, String text) {
+        if (text == null) return;
+        for (int i = 0; i < text.length(); i++) {
+            char c = text.charAt(i);
+            if (Character.isHighSurrogate(c) && i + 1 < text.length() && Character.isLowSurrogate(text.charAt(i + 1))) {
+                i++;
+            } else if (Character.isSurrogate(c)) {
+                throw new IllegalArgumentException(what + " contains an unpaired surrogate character and is not valid text");
             }
         }
     }

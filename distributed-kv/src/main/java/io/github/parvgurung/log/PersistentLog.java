@@ -44,11 +44,15 @@ public final class PersistentLog implements AutoCloseable {
         Files.createDirectories(filePath.getParent());
         boolean needsRewrite = false;
         if (Files.exists(filePath)) {
-            String content = Files.readString(filePath, StandardCharsets.UTF_8);
-            // Every append writes "<entry>\n" in one go, so a final segment without a newline is a
-            // write that was cut short by a crash. It was never acknowledged; drop it.
+            byte[] bytes = Files.readAllBytes(filePath);
+            // Every append writes "<entry>\n" in one go, so bytes after the last newline are a write that
+            // was cut short by a crash (possibly in the middle of a multi-byte character, which is why we
+            // split on raw bytes before decoding). It was never acknowledged; drop it.
+            int complete = bytes.length;
+            while (complete > 0 && bytes[complete - 1] != '\n') complete--;
+            needsRewrite = complete != bytes.length;
+            String content = new String(bytes, 0, complete, StandardCharsets.UTF_8);
             String[] lines = content.split("\n", -1);
-            needsRewrite = !lines[lines.length - 1].isEmpty();
             for (int i = 0; i < lines.length - 1; i++) {
                 String line = lines[i];
                 if (line.isBlank())
@@ -67,21 +71,33 @@ public final class PersistentLog implements AutoCloseable {
             }
         }
         if (needsRewrite)
-            rewriteFile();
+            rewriteFile(entries);
         openForAppend();
     }
 
     public synchronized void append(LogEntry entry) throws IOException {
+        appendAll(List.of(entry));
+    }
+
+    /** Appends several entries with a single fsync. All of them are written, or (on failure) none are kept. */
+    public synchronized void appendAll(List<LogEntry> batch) throws IOException {
+        if (batch.isEmpty())
+            return;
         long expectedIndex = lastIndex() + 1;
-        if (entry.index() != expectedIndex)
-            throw new IllegalArgumentException("Out-of-order append: expected index " + expectedIndex + " but got " + entry.index());
-        String line = entry.serialize() + "\n";
+        StringBuilder text = new StringBuilder();
+        for (LogEntry entry : batch) {
+            if (entry.index() != expectedIndex)
+                throw new IllegalArgumentException("Out-of-order append: expected index " + expectedIndex + " but got " + entry.index());
+            text.append(entry.serialize()).append('\n');
+            expectedIndex++;
+        }
+        ensureOpen();
         long startPos = raf.length();
         try {
-            raf.write(line.getBytes(StandardCharsets.UTF_8));
+            raf.write(text.toString().getBytes(StandardCharsets.UTF_8));
             channel.force(true);
         } catch (IOException e) {
-            // Don't leave a partial line behind for the next append to be glued onto.
+            // Don't leave partial lines behind for the next append to be glued onto.
             try {
                 raf.setLength(startPos);
                 raf.seek(startPos);
@@ -89,7 +105,7 @@ public final class PersistentLog implements AutoCloseable {
             }
             throw e;
         }
-        entries.add(entry);
+        entries.addAll(batch);
     }
 
     public synchronized void truncateFrom(long fromIndex) throws IOException {
@@ -97,10 +113,8 @@ public final class PersistentLog implements AutoCloseable {
             throw new IllegalArgumentException("Cannot truncate from index " + fromIndex
                 + "; entries up to " + baseIndex + " are covered by the snapshot (and indexes start at 1)");
         if (fromIndex > lastIndex()) return;
-        while (lastIndex() >= fromIndex) {
-            entries.remove(entries.size() - 1);
-        }
-        rewriteAndReopen();
+        List<LogEntry> kept = new ArrayList<>(entries.subList(0, (int) (fromIndex - baseIndex - 1)));
+        replaceContents(kept, baseIndex, baseTerm);
     }
 
     /**
@@ -113,21 +127,39 @@ public final class PersistentLog implements AutoCloseable {
         if (index <= baseIndex)
             return;
         Optional<LogEntry> boundary = get(index);
-        if (boundary.isPresent() && boundary.get().term() == term) {
-            entries.subList(0, (int) (index - baseIndex)).clear();
-        } else {
-            entries.clear();
-        }
-        baseIndex = index;
-        baseTerm = term;
-        rewriteAndReopen();
+        List<LogEntry> kept = boundary.isPresent() && boundary.get().term() == term
+            ? new ArrayList<>(entries.subList((int) (index - baseIndex), entries.size()))
+            : new ArrayList<>();
+        replaceContents(kept, index, term);
     }
 
-    private void rewriteAndReopen() throws IOException {
-        channel.close();
-        raf.close();
-        rewriteFile();
+    /**
+     * Makes the file hold exactly {@code newEntries}, and only then updates memory. If writing the file
+     * fails, nothing has changed and memory still matches the old (intact) file.
+     */
+    private void replaceContents(List<LogEntry> newEntries, long newBaseIndex, long newBaseTerm) throws IOException {
+        rewriteFile(newEntries);
+        entries.clear();
+        entries.addAll(newEntries);
+        baseIndex = newBaseIndex;
+        baseTerm = newBaseTerm;
+        closeQuietly();
         openForAppend();
+    }
+
+    private void closeQuietly() {
+        try {
+            if (channel != null) channel.close();
+            if (raf != null) raf.close();
+        } catch (IOException ignored) {
+        }
+        channel = null;
+        raf = null;
+    }
+
+    private void ensureOpen() throws IOException {
+        if (raf == null || channel == null || !channel.isOpen())
+            openForAppend();
     }
 
     private void openForAppend() throws IOException {
@@ -136,9 +168,9 @@ public final class PersistentLog implements AutoCloseable {
         channel = raf.getChannel();
     }
 
-    private void rewriteFile() throws IOException {
+    private void rewriteFile(List<LogEntry> toWrite) throws IOException {
         StringBuilder sb = new StringBuilder();
-        for (LogEntry e : entries) {
+        for (LogEntry e : toWrite) {
             sb.append(e.serialize()).append('\n');
         }
         FileUtil.writeAtomically(filePath, sb.toString().getBytes(StandardCharsets.UTF_8));

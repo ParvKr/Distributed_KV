@@ -204,7 +204,11 @@
   const params = new URLSearchParams(location.search);
   const demo = params.has("demo");
   const parseAddresses = text => text.split(/[,\s]+/).map(x => x.trim()).filter(Boolean);
-  let explicit = !demo && params.get("nodes") ? parseAddresses(params.get("nodes")) : null;
+  // Accepts host:port, optionally with http:// or https:// in front.
+  const ADDRESS = /^(https?:\/\/)?(\[[0-9a-fA-F:]+\]|[A-Za-z0-9._-]+)(:\d{1,5})?$/;
+  // Anything from the link or from another node is untrusted: keep only well-formed addresses.
+  const linked = !demo && params.get("nodes") ? parseAddresses(params.get("nodes")).filter(a => ADDRESS.test(a)) : [];
+  let explicit = linked.length ? linked : null;
   const SAVED_KEY = "raft-dashboard-nodes";
 
   const nodes = new Map();          // node id (or a placeholder key until the id is known) -> entry
@@ -302,6 +306,29 @@
   })();
 
   // ---- polling ----------------------------------------------------------------------------------
+  const ROLES = { LEADER: "Leader", FOLLOWER: "Follower", CANDIDATE: "Candidate" };
+
+  // A node's reply is data, not markup: accept only the expected shapes and coerce every number, so a
+  // hostile or broken node cannot inject HTML or script through fields we later print.
+  function cleanStatus(raw) {
+    if (!raw || typeof raw !== "object" || !Object.prototype.hasOwnProperty.call(ROLES, raw.role))
+      throw new Error("not a node status");
+    const whole = v => { const n = Number(v); if (!Number.isInteger(n) || n < 0) throw new Error("bad number"); return n; };
+    const id = whole(raw.nodeId);
+    if (id < 1) throw new Error("bad node id");
+    const peers = (Array.isArray(raw.peers) ? raw.peers : [])
+      .filter(p => p && Number.isInteger(p.id) && p.id >= 1 && typeof p.address === "string" && ADDRESS.test(p.address))
+      .map(p => ({ id: p.id, address: p.address }));
+    return {
+      nodeId: id, role: raw.role, term: whole(raw.term),
+      leaderId: raw.leaderId == null ? null : whole(raw.leaderId),
+      lastLogIndex: whole(raw.lastLogIndex), lastLogTerm: whole(raw.lastLogTerm),
+      commitIndex: whole(raw.commitIndex), lastApplied: whole(raw.lastApplied),
+      snapshotIndex: whole(raw.snapshotIndex), snapshotThreshold: whole(raw.snapshotThreshold),
+      keys: whole(raw.keys), peers
+    };
+  }
+
   async function fetchStatus(entry) {
     if (demo) return Demo.status(entry.id);
     const ctl = new AbortController();
@@ -332,7 +359,7 @@
     await Promise.all([...nodes.values()].map(async entry => {
       const before = { up: entry.up, status: entry.status };
       try {
-        const status = await fetchStatus(entry);
+        const status = cleanStatus(await fetchStatus(entry));
         if (gen !== generation) return;
         entry.status = status; entry.up = true; entry.lastSeen = Date.now(); everAnswered = true;
         adopt(entry, status);
@@ -462,7 +489,7 @@
 
   function renderNode(n, scale) {
     const s = n.status;
-    const roleName = !n.up ? "Not responding" : s ? { LEADER: "Leader", FOLLOWER: "Follower", CANDIDATE: "Candidate" }[s.role] : "Checking";
+    const roleName = !n.up ? "Not responding" : s ? ROLES[s.role] : "Checking";
     const cls = ["node", n.up === false ? "down" : "", s && n.up ? s.role.toLowerCase() : ""].join(" ");
     const where = shown(n.address);
     const addr = demo ? esc(where) : `<a href="${esc(baseUrl(n.address))}/status.json">${esc(where)}</a>`;
@@ -540,7 +567,7 @@
       const body = await res.json().catch(() => null);
       if (!body) throw new Error("Unexpected reply from " + shown(base) + " (HTTP " + res.status + ").");
       if (body.success) return body;
-      if (body.leaderHint && body.leaderHint !== address) { address = body.leaderHint; continue; }
+      if (body.leaderHint && ADDRESS.test(body.leaderHint) && shown(body.leaderHint) !== shown(address)) { address = body.leaderHint; continue; }
       throw new Error(body.error === "not leader"
         ? "That node isn't the leader and doesn't know who is. An election may be running. Try again in a moment."
         : body.error || "The request failed.");
@@ -584,9 +611,6 @@
     input.value = explicit ? explicit.join(", ") : saved();
   }
 
-  // Accepts host:port, optionally with http:// or https:// in front.
-  const ADDRESS = /^(https?:\/\/)?(\[[0-9a-fA-F:]+\]|[A-Za-z0-9._-]+)(:\d{1,5})?$/;
-
   function connect(list) {
     explicit = list;
     generation++;
@@ -622,7 +646,11 @@
   });
 
   (async function loop() {
-    if (!paused) await pollOnce();
+    try {
+      if (!paused) await pollOnce();
+    } catch (e) {
+      console.error("Poll failed, will retry:", e);   // keep going: a transient error must not stop the dashboard
+    }
     setTimeout(loop, POLL_MS);
   })();
 })();

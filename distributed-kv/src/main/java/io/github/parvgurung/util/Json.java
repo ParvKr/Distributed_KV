@@ -133,7 +133,29 @@ public final class Json {
         Object value = obj.get(key);
         if(value == null)
             return new ArrayList<>();
-        return (List<Map<String, Object>>) (List<?>) value;
+        if(!(value instanceof List<?> list))
+            throw new IllegalArgumentException("Field '" + key + "' is not an array: " + value);
+        for(Object item : list) {
+            if(!(item instanceof Map))
+                throw new IllegalArgumentException("Field '" + key + "' must contain only objects, but has: " + item);
+        }
+        return (List<Map<String, Object>>) (List<?>) list;
+    }
+
+    /** A term, log index or similar counter: a whole number that is never negative. */
+    public static long getNonNegativeLong(Map<?, ?> obj, String key) {
+        long value = getLong(obj, key);
+        if(value < 0)
+            throw new IllegalArgumentException("Field '" + key + "' must not be negative: " + value);
+        return value;
+    }
+
+    /** A node id: a positive number that fits an int. */
+    public static long getNodeId(Map<?, ?> obj, String key) {
+        long value = getLong(obj, key);
+        if(value < 1 || value > Integer.MAX_VALUE)
+            throw new IllegalArgumentException("Field '" + key + "' is not a valid node id: " + value);
+        return value;
     }
 
     // DECODING METHODS
@@ -153,8 +175,12 @@ public final class Json {
     }
 
     private static final class Parser {
+        // Deeper than any real message, shallow enough that recursion cannot overflow the stack.
+        private static final int MAX_DEPTH = 100;
+
         private final String s;
         private int pos = 0;
+        private int depth = 0;
 
         Parser(String s) {
             this.s = s;
@@ -186,8 +212,8 @@ public final class Json {
             char c = peek();
             return switch(c) {
                 case '"' -> parseString();
-                case '{' -> parseObject();
-                case '[' -> parseArray();
+                case '{' -> nested(this::parseObject);
+                case '[' -> nested(this::parseArray);
                 case 't', 'f' -> parseBoolean();
                 case 'n' -> parseNull();
                 default -> {
@@ -197,6 +223,16 @@ public final class Json {
                         throw new IllegalArgumentException("Unexpected character '" + c + "' at position " + pos + " in: " + s);
                 }
             };
+        }
+
+        private <T> T nested(java.util.function.Supplier<T> parser) {
+            if (++depth > MAX_DEPTH)
+                throw new IllegalArgumentException("JSON is nested more than " + MAX_DEPTH + " levels deep at position " + pos);
+            try {
+                return parser.get();
+            } finally {
+                depth--;
+            }
         }
 
         Map<String, Object> parseObject() {
