@@ -393,7 +393,34 @@ public final class RaftNode implements RaftRpcHandler{
         }
     }
 
+    // At most one AppendEntries per follower is in flight. Writes that arrive meanwhile are not sent one by one:
+    // they pile up and go out together in the next request, so the follower pays one fsync for many entries
+    // instead of one per entry, and the leader stops flooding it with overlapping requests.
+    private final Map<Integer, AtomicBoolean> replicating = new ConcurrentHashMap<>();
+    private final Set<Integer> replicateAgain = ConcurrentHashMap.newKeySet();
+
     private void replicateToPeer(int peerId, NodeConfig.PeerAddress peerAddress) {
+        AtomicBoolean busy = replicating.computeIfAbsent(peerId, id -> new AtomicBoolean(false));
+        if (!busy.compareAndSet(false, true)) {
+            replicateAgain.add(peerId);   // whoever is sending now will send again when it finishes
+            return;
+        }
+        try {
+            replicateToPeerOnce(peerId, peerAddress);
+        } finally {
+            busy.set(false);
+            // A request that arrived after we last looked but before we cleared the flag must not be lost.
+            if (replicateAgain.remove(peerId)) {
+                try {
+                    rpcExecutor.submit(() -> replicateToPeer(peerId, peerAddress));
+                } catch (RejectedExecutionException shuttingDown) {
+                    // node is stopping
+                }
+            }
+        }
+    }
+
+    private void replicateToPeerOnce(int peerId, NodeConfig.PeerAddress peerAddress) {
         final long term;
         final long prevLogIndex;
         final long prevLogTerm;
@@ -528,7 +555,9 @@ public final class RaftNode implements RaftRpcHandler{
             Optional<LogEntry> entry = log.get(n);
             if (entry.isEmpty() || entry.get().term() != persistentState.getCurrentTerm())
                 continue;
-            int count = 1;
+            // The leader's own copy counts only once it is on disk: a majority must mean "a majority have it
+            // durably", or a crash could lose an entry the cluster already treated as committed.
+            int count = log.durableIndex() >= n ? 1 : 0;
             for (long m : matchIndex.values()) {
                 if (m >= n) count++;
             }
@@ -844,15 +873,28 @@ public final class RaftNode implements RaftRpcHandler{
             }
             try {
                 index = log.lastIndex() + 1;
-                log.append(new LogEntry(index, persistentState.getCurrentTerm(), command));
+                // No fsync here: this runs under the node lock, and a lock held across a disk flush would
+                // serialise every write (and stall heartbeats). The flush happens below, shared with any
+                // other writers that arrive meanwhile.
+                log.appendWithoutSync(new LogEntry(index, persistentState.getCurrentTerm(), command));
             } catch (IOException e) {
                 return ClientResponse.error("Failed to persist write: " + e.getMessage());
             }
             future = new CompletableFuture<>();
             pendingClientWrites.put(index, future);
-            tryAdvanceCommitIndex(); // a single-node cluster commits on its own
         }
-        replicateToAllPeers();
+        replicateToAllPeers(); // followers can start storing the entry while we flush our own copy
+        try {
+            log.syncUpTo(index);
+        } catch (IOException e) {
+            pendingClientWrites.remove(index);
+            return ClientResponse.error("Failed to persist write: " + e.getMessage());
+        }
+        synchronized (this) {
+            // Our own copy is durable now, so it may count towards the majority (it could not before).
+            // This is also what commits a write in a single-node cluster.
+            if (role == NodeRole.LEADER) tryAdvanceCommitIndex();
+        }
         try {
             Boolean committed = future.get(CLIENT_WRITE_TIMEOUT_MS, TimeUnit.MILLISECONDS);
             if (Boolean.TRUE.equals(committed)) {
@@ -907,6 +949,11 @@ public final class RaftNode implements RaftRpcHandler{
         }
         obj.put("peers", peerList);
         return Json.encode(obj);
+    }
+
+    /** Number of fsyncs the log has performed so far. */
+    public synchronized long logSyncCount() {
+        return log.syncCount();
     }
 
     // Package-private views for tests that check cluster-wide invariants.

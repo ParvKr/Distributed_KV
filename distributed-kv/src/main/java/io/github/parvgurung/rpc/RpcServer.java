@@ -20,7 +20,7 @@ public class RpcServer {
     private HttpServer server;
     private ExecutorService executor;
 
-    private final String allowOrigin;
+    private final Set<String> allowedOrigins;   // from --allowOrigin; may contain "*"
     private final Set<String> trustedOrigins;
 
     public RpcServer(int port, RaftRpcHandler handler) {
@@ -34,7 +34,11 @@ public class RpcServer {
     public RpcServer(int port, RaftRpcHandler handler, String allowOrigin, Set<String> trustedOrigins) {
         this.port = port;
         this.handler = handler;
-        this.allowOrigin = allowOrigin;
+        Set<String> allowed = new java.util.HashSet<>();
+        if (allowOrigin != null) {
+            for (String origin : allowOrigin.split(",")) allowed.add(origin.trim());
+        }
+        this.allowedOrigins = Set.copyOf(allowed);
         this.trustedOrigins = Set.copyOf(trustedOrigins);
     }
 
@@ -120,9 +124,9 @@ public class RpcServer {
 
     /** The value for Access-Control-Allow-Origin, or null if a page from {@code origin} gets no access. */
     private String corsOriginFor(String origin) {
-        if ("*".equals(allowOrigin))
+        if (allowedOrigins.contains("*"))
             return "*";
-        if (origin != null && (origin.equals(allowOrigin) || trustedOrigins.contains(origin)))
+        if (origin != null && (allowedOrigins.contains(origin) || trustedOrigins.contains(origin)))
             return origin;
         return null;
     }

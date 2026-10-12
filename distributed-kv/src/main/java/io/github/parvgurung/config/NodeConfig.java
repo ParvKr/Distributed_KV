@@ -19,8 +19,9 @@ public final class NodeConfig {
     public static final int DEFAULT_SNAPSHOT_THRESHOLD = 1000;
 
     /**
-     * The one web origin (or "*") allowed to call the client endpoints from a browser, or null to allow
-     * none. A dashboard served by the node itself is same-origin and needs no setting.
+     * Web origins (comma separated, or "*") allowed to call the client endpoints from a browser, or null to
+     * allow none. Nodes already trust their peers' origins; this is for a page hosted somewhere else or
+     * reached under a different name (e.g. through Docker port mappings).
      */
     public final String allowOrigin;
 
@@ -35,8 +36,14 @@ public final class NodeConfig {
     public NodeConfig(int nodeId, int port, Path dataDir, Map<Integer, PeerAddress> peers, int snapshotThreshold, String allowOrigin) {
         if (snapshotThreshold < 0)
             throw new IllegalArgumentException("snapshotThreshold cannot be negative");
-        if (allowOrigin != null && !allowOrigin.equals("*") && !allowOrigin.matches("https?://[^/\\s]+"))
-            throw new IllegalArgumentException("allowOrigin must be \"*\" or an origin like https://example.com (no path), but got: " + allowOrigin);
+        if (allowOrigin != null) {
+            for (String origin : allowOrigin.split(",", -1)) {
+                String o = origin.trim();
+                if (!o.equals("*") && !o.matches("https?://[^/\\s,]+"))
+                    throw new IllegalArgumentException("allowOrigin must be \"*\" or origins like https://example.com (no path), "
+                        + "separated by commas, but got: " + allowOrigin);
+            }
+        }
         this.allowOrigin = allowOrigin;
         this.nodeId = nodeId;
         this.port = port;

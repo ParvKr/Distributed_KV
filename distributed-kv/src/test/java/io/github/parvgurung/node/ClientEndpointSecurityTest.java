@@ -118,6 +118,16 @@ class ClientEndpointSecurityTest {
     }
 
     @Test
+    void severalConfiguredOriginsAreEachAllowed() throws Exception {
+        startNodeWithPeer("http://localhost:8001, http://localhost:8002 ,https://dash.example.com");
+        for (String origin : new String[]{"http://localhost:8001", "http://localhost:8002", "https://dash.example.com"}) {
+            assertEquals(origin, allowedOrigin(send("OPTIONS", "/client/set", null, null, origin)), origin);
+        }
+        assertNull(allowedOrigin(send("GET", "/client/get?key=k", null, null, "http://localhost:8003")));
+        assertNull(allowedOrigin(send("GET", "/client/get?key=k", null, null, STRANGER)));
+    }
+
+    @Test
     void wildcardAllowsAnyOrigin() throws Exception {
         startNodeWithPeer("*");
         assertEquals("*", allowedOrigin(send("GET", "/client/get?key=k", null, null, STRANGER)));
@@ -165,6 +175,12 @@ class ClientEndpointSecurityTest {
         assertEquals("https://example.com",
             NodeConfig.fromArgs(new String[]{"--id=1", "--port=8001", "--allowOrigin=https://example.com"}).allowOrigin);
         assertEquals("*", NodeConfig.fromArgs(new String[]{"--id=1", "--port=8001", "--allowOrigin=*"}).allowOrigin);
+        assertEquals("http://a.example,http://b.example:8080",
+            NodeConfig.fromArgs(new String[]{"--id=1", "--port=8001", "--allowOrigin=http://a.example,http://b.example:8080"}).allowOrigin);
+        assertThrows(IllegalArgumentException.class,
+            () -> NodeConfig.fromArgs(new String[]{"--id=1", "--port=8001", "--allowOrigin=http://a.example,bogus"}));
+        assertThrows(IllegalArgumentException.class,
+            () -> NodeConfig.fromArgs(new String[]{"--id=1", "--port=8001", "--allowOrigin=http://a.example,"}));
         assertNull(NodeConfig.fromArgs(new String[]{"--id=1", "--port=8001"}).allowOrigin);
     }
 }

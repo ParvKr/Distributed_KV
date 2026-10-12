@@ -1,0 +1,39 @@
+<!doctype html>
+<html lang="en"><head><meta charset="utf-8"><title>I built Raft from scratch. The algorithm was the easy part.</title>
+<style>
+body { font-family: Georgia, 'Times New Roman', serif; line-height: 1.6; color: #1b1f24; max-width: 40rem; margin: 2rem auto; padding: 0 1rem; font-size: 17px; }
+h1 { font-size: 1.9rem; line-height: 1.25; } h2 { font-size: 1.35rem; margin-top: 1.8em; }
+</style></head>
+<body><p style="background:#fff7d6;border:1px solid #e6d27a;padding:.6em .8em;font-family:sans-serif;font-size:14px">To publish: select everything below this box, copy, and paste into the LinkedIn article editor (or any blog editor). Replace [GitHub link] with your repository URL.</p>
+<h1>I built Raft from scratch. The algorithm was the easy part.</h1>
+<p>I wanted to understand distributed consensus properly, so I built a fault-tolerant key-value store in Java using the Raft algorithm: no frameworks and no consensus libraries (the main code uses only the JDK). It runs as a cluster of nodes that agree on every write, keeps working when a minority of nodes fail, and never loses a write it has acknowledged.</p>
+<p>Raft is famous for being understandable, and it is. The paper fits in a few pages. What the paper does not tell you is how many ways the surrounding code can go wrong. I ended up recording 24 real bugs, and most of them had nothing to do with the Raft rules.</p>
+<h2>What I built</h2>
+<ul>
+<li>Leader election with PreVote and CheckQuorum, so a node that rejoins the cluster can&#39;t knock over a healthy leader</li>
+<li>Log replication, with automatic repair when a follower&#39;s log has diverged</li>
+<li>Durable storage with crash recovery, snapshots and log compaction</li>
+<li>Retry-safe writes: a client can retry a timed-out request without it being applied twice</li>
+<li>Reads that never return stale data, even from a leader that has been cut off</li>
+<li>A live web dashboard served by every node, a benchmark tool, and a Docker Compose setup</li>
+</ul>
+<h2>Three bugs that taught me the most</h2>
+<p><strong>1. A single keyword made every write fail.</strong> My first cluster test wrote one key and got &quot;timed out&quot; after exactly two seconds, every time. The write handler held a lock while waiting for the commit, but the commit needed that same lock to finish. Nothing could move until the timeout released it. The write then succeeded, so clients were told it failed when it hadn&#39;t. The same stall starved the heartbeats, so followers kept starting elections; the leftover state files showed term 57. The fix was deleting the word <code>synchronized</code>.</p>
+<p><strong>2. Half an emoji corrupted data.</strong> A fuzz test generated a key containing one half of an emoji. That is valid in JSON and in Java, but UTF-8 can&#39;t encode it. The store acknowledged the write, then wrote a question mark to disk. After a restart the data was different from what had been acknowledged, and two different keys could collide. I would never have thought to write that test by hand.</p>
+<p><strong>3. A web page could depose my leader.</strong> I had locked down the client endpoints against cross-site requests, but I&#39;d forgotten the three node-to-node endpoints. An independent code review caught it: any website could send a plain cross-site POST and make a local node adopt a forged term. Now the Raft endpoints accept only JSON requests, which forces browsers to run a safety check first.</p>
+<h2>How I tested it</h2>
+<p>No single technique found everything. Integration tests found the concurrency bugs. Fuzzing and model-based tests found the data-layer bugs. An independent review found the security gaps. A randomized chaos test, which partitions, crashes and restarts nodes while clients write and read, checks the guarantees that matter: never two leaders in a term, no acknowledged write lost, no wrong read, and every replica converging afterwards.</p>
+<p>The most useful lesson was about the tests themselves. I deliberately broke the voting rule to see whether the chaos test would notice. It didn&#39;t, at first. PreVote contained its own copy of the same check and was hiding the broken one. Only after I disabled both did the test fail. A test that can&#39;t fail tells you nothing.</p>
+<h2>Performance, measured honestly</h2>
+<p>My first benchmark gave 190 writes per second. Instead of guessing, I wrote a 20-line probe: one fsync took 3.7 ms on my laptop, but 300 appends sharing one fsync took only 5.9 ms. That ratio, about fifty to one, told me where the time was going. Group commit on the leader and one in-flight request per follower brought writes to about 620 per second at 16 clients (3.3 times better) with the median latency falling from 85 ms to 25 ms. Reads reach about 4,650 per second, and a leader failover takes roughly a second.</p>
+<p>These are laptop numbers, one machine, one JVM, loopback networking, so I treat them as a relative guide and not a production claim.</p>
+<h2>What it can&#39;t do yet</h2>
+<p>There are no cluster membership changes, no authentication or TLS, and my tests simulate process crashes but not power loss. The write-up lists these plainly. I&#39;d rather say what&#39;s missing than let readers find out.</p>
+<h2>What I took away</h2>
+<p>The algorithm is the small part. The bugs lived in locks, timers, file formats, character encodings and browsers. Tests that check invariants (&quot;one leader per term&quot;, &quot;no acknowledged write is lost&quot;) cover scenarios nobody wrote down. And measuring before and after an optimization is worth twenty lines of code every time.</p>
+<p>This project was built with the help of an AI coding assistant (Claude Code), including parts of the implementation, the tests and the independent code review. The design decisions, the experiments and the conclusions are what I&#39;m sharing here.</p>
+<p>Code, full technical report and benchmark tool: [GitHub link]</p>
+<p>#distributedsystems #raft #java #softwareengineering</p>
+
+
+</body></html>

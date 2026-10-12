@@ -1,0 +1,41 @@
+# A 3-node cluster on one machine.
+#
+#   docker compose up --build
+#
+# Dashboard (any node):  http://localhost:8001/dashboard?nodes=localhost:8001,localhost:8002,localhost:8003
+#
+# Inside the Docker network the nodes find each other as node1/node2/node3. Your browser reaches them as
+# localhost:8001-8003, so each node is told (--allowOrigin) to accept the dashboard pages served by its siblings
+# under those names. Remove that flag if you do not use the dashboard's data console.
+x-node: &node
+  build: .
+  image: raftkv:latest
+  restart: unless-stopped
+  stop_grace_period: 10s
+
+services:
+  node1:
+    <<: *node
+    command: ["--id=1", "--port=8001", "--dataDir=/data", "--peers=2:node2:8001,3:node3:8001",
+              "--allowOrigin=http://localhost:8001,http://localhost:8002,http://localhost:8003"]
+    ports: ["8001:8001"]
+    volumes: ["node1-data:/data"]
+
+  node2:
+    <<: *node
+    command: ["--id=2", "--port=8001", "--dataDir=/data", "--peers=1:node1:8001,3:node3:8001",
+              "--allowOrigin=http://localhost:8001,http://localhost:8002,http://localhost:8003"]
+    ports: ["8002:8001"]
+    volumes: ["node2-data:/data"]
+
+  node3:
+    <<: *node
+    command: ["--id=3", "--port=8001", "--dataDir=/data", "--peers=1:node1:8001,2:node2:8001",
+              "--allowOrigin=http://localhost:8001,http://localhost:8002,http://localhost:8003"]
+    ports: ["8003:8001"]
+    volumes: ["node3-data:/data"]
+
+volumes:
+  node1-data:
+  node2-data:
+  node3-data:

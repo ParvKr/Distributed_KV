@@ -4,6 +4,7 @@ import io.github.parvgurung.util.FileUtil;
 
 import java.io.IOException;
 import java.io.RandomAccessFile;
+import java.nio.channels.ClosedChannelException;
 import java.nio.channels.FileChannel;
 import java.nio.charset.StandardCharsets;
 import java.nio.file.Files;
@@ -23,6 +24,12 @@ public final class PersistentLog implements AutoCloseable {
     private long baseTerm = 0;
     private RandomAccessFile raf;
     private FileChannel channel;
+
+    // Group commit: entries can be appended without an fsync and made durable later, one fsync covering
+    // everything appended so far. durableIndex is the highest index known to be on disk.
+    private long durableIndex = 0;
+    private boolean syncing = false;
+    private long syncCount = 0;
 
     public PersistentLog(String dataDir) {
         this.filePath = Path.of(dataDir, "raft.log");
@@ -73,6 +80,7 @@ public final class PersistentLog implements AutoCloseable {
         if (needsRewrite)
             rewriteFile(entries);
         openForAppend();
+        durableIndex = lastIndex();   // whatever we just read is on disk
     }
 
     public synchronized void append(LogEntry entry) throws IOException {
@@ -91,11 +99,33 @@ public final class PersistentLog implements AutoCloseable {
             text.append(entry.serialize()).append('\n');
             expectedIndex++;
         }
+        writeToFile(text.toString(), true);
+        entries.addAll(batch);
+        durableIndex = lastIndex();   // the fsync above also covered anything appended earlier without one
+    }
+
+    /**
+     * Appends one entry to the file and memory but does not fsync. It is not durable until
+     * {@link #syncUpTo} has returned for its index; until then it must not be counted as stored.
+     * Cheap enough to call while holding a lock, which is the point: the slow fsync happens elsewhere.
+     */
+    public synchronized void appendWithoutSync(LogEntry entry) throws IOException {
+        long expectedIndex = lastIndex() + 1;
+        if (entry.index() != expectedIndex)
+            throw new IllegalArgumentException("Out-of-order append: expected index " + expectedIndex + " but got " + entry.index());
+        writeToFile(entry.serialize() + "\n", false);
+        entries.add(entry);
+    }
+
+    private void writeToFile(String text, boolean sync) throws IOException {
         ensureOpen();
         long startPos = raf.length();
         try {
-            raf.write(text.toString().getBytes(StandardCharsets.UTF_8));
-            channel.force(true);
+            raf.write(text.getBytes(StandardCharsets.UTF_8));
+            if (sync) {
+                channel.force(true);
+                syncCount++;
+            }
         } catch (IOException e) {
             // Don't leave partial lines behind for the next append to be glued onto.
             try {
@@ -105,7 +135,61 @@ public final class PersistentLog implements AutoCloseable {
             }
             throw e;
         }
-        entries.addAll(batch);
+    }
+
+    /**
+     * Blocks until the entry at {@code index} (and everything before it) is on disk. Callers that arrive while
+     * an fsync is already running wait for it, and a single fsync makes every entry appended before it started
+     * durable, so concurrent writers share fsyncs instead of each paying for their own.
+     */
+    public void syncUpTo(long index) throws IOException {
+        final FileChannel toSync;
+        final long covers;
+        synchronized (this) {
+            while (true) {
+                if (durableIndex >= index || index > lastIndex())
+                    return;   // already durable, or the entry no longer exists (the log was rewritten)
+                if (!syncing)
+                    break;
+                try {
+                    wait();
+                } catch (InterruptedException e) {
+                    Thread.currentThread().interrupt();
+                    throw new IOException("Interrupted while waiting for the log to be synced", e);
+                }
+            }
+            syncing = true;
+            ensureOpen();
+            toSync = channel;
+            covers = lastIndex();   // everything appended up to now is written, so this fsync will cover it
+        }
+        boolean succeeded = false;
+        try {
+            toSync.force(true);
+            succeeded = true;
+        } catch (ClosedChannelException e) {
+            // The file was replaced by a rewrite (compaction or truncation) or the log was closed. A rewrite
+            // fsyncs everything it keeps and updates durableIndex itself, so there is nothing left to do.
+        } finally {
+            synchronized (this) {
+                syncing = false;
+                if (succeeded) {
+                    syncCount++;
+                    durableIndex = Math.max(durableIndex, Math.min(covers, lastIndex()));
+                }
+                notifyAll();
+            }
+        }
+    }
+
+    /** The highest log index known to be on disk. */
+    public synchronized long durableIndex() {
+        return durableIndex;
+    }
+
+    /** How many fsyncs this log has performed (for tests and benchmarks). */
+    public synchronized long syncCount() {
+        return syncCount;
     }
 
     public synchronized void truncateFrom(long fromIndex) throws IOException {
@@ -143,8 +227,10 @@ public final class PersistentLog implements AutoCloseable {
         entries.addAll(newEntries);
         baseIndex = newBaseIndex;
         baseTerm = newBaseTerm;
+        durableIndex = lastIndex();   // the atomic rewrite fsynced everything it kept
         closeQuietly();
         openForAppend();
+        notifyAll();                  // wake any syncUpTo waiting on entries that no longer exist
     }
 
     private void closeQuietly() {
